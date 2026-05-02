@@ -677,6 +677,11 @@ async fn handle_bot_command(
     Ok(())
 }
 
+/// Messages requested per JOIN / DM open. The server returns up to 100 per
+/// page; the backfill loop paginates until this many are collected or the
+/// room has no more history.
+const BACKFILL_LIMIT: u32 = 1000;
+
 async fn backfill_channel(
     write: &mut (impl tokio::io::AsyncWrite + Unpin),
     chan: &str,
@@ -689,7 +694,7 @@ async fn backfill_channel(
         .to_matrix
         .try_send(ToMatrix::Backfill {
             room: room.to_owned(),
-            limit: 200,
+            limit: BACKFILL_LIMIT,
             reply: tx,
         })
         .is_err()
