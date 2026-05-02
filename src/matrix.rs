@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -14,7 +15,7 @@ use matrix_sdk::ruma::events::room::message::{
 use matrix_sdk::ruma::events::room::topic::SyncRoomTopicEvent;
 use matrix_sdk::ruma::events::room::MediaSource;
 use matrix_sdk::ruma::events::{
-    AnySyncMessageLikeEvent, AnySyncTimelineEvent, SyncMessageLikeEvent,
+    AnySyncMessageLikeEvent, AnySyncTimelineEvent, Mentions, SyncMessageLikeEvent,
 };
 use matrix_sdk::store::RoomLoadSettings;
 use matrix_sdk::{Client, EncryptionState, Room, RoomMemberships, RoomState, SessionMeta, SessionTokens};
@@ -87,12 +88,20 @@ async fn accept_event(
     Some((nick, sender == own))
 }
 
-fn emit_message(bridge: &Bridge, room: &matrix_sdk::ruma::RoomId, nick: String, body: String, is_own: bool) {
+fn emit_message(
+    bridge: &Bridge,
+    room: &matrix_sdk::ruma::RoomId,
+    nick: String,
+    body: String,
+    is_own: bool,
+    mentions_self: bool,
+) {
     let _ = bridge.from_matrix.send(FromMatrix::Message {
         room: room.to_owned(),
         sender_nick: nick,
         body,
         is_own,
+        mentions_self,
     });
 }
 
@@ -107,10 +116,14 @@ async fn sender_nick(room: &Room, sender: &matrix_sdk::ruma::UserId) -> String {
     }
 }
 
+/// Punctuation accepted in IRC nicks. Used by `sanitize_nick` and
+/// `is_nick_char`; keep them in sync.
+const NICK_PUNCT: &str = "-_|[]{}";
+
 fn sanitize_nick(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        if c.is_ascii_alphanumeric() || "-_|[]{}".contains(c) {
+        if c.is_ascii_alphanumeric() || NICK_PUNCT.contains(c) {
             out.push(c);
         } else if !out.ends_with('_') {
             out.push('_');
@@ -125,6 +138,207 @@ fn sanitize_nick(s: &str) -> String {
         capped.insert(0, '_');
     }
     capped
+}
+
+#[derive(Debug, Clone)]
+struct MentionSpan {
+    start: usize,
+    end: usize,
+    mxid: matrix_sdk::ruma::OwnedUserId,
+    pill_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MentionCandidate {
+    start: usize,
+    end: usize,
+    /// Lowercased nick, ready to look up against `member_mention_index`.
+    key: String,
+    /// Span starts with `@`, so the rendered pill keeps the prefix.
+    has_at: bool,
+}
+
+fn is_nick_char(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || NICK_PUNCT.as_bytes().contains(&c)
+}
+
+fn nick_span_end(body: &str, start: usize) -> Option<usize> {
+    let bytes = body.as_bytes();
+    let mut i = start;
+    while i < bytes.len() && is_nick_char(bytes[i]) {
+        i += 1;
+    }
+    (i > start).then_some(i)
+}
+
+/// True when `body[end..]` looks like the `:server` tail of an MXID.
+fn looks_like_mxid_tail(body: &str, end: usize) -> bool {
+    let bytes = body.as_bytes();
+    if bytes.get(end) != Some(&b':') {
+        return false;
+    }
+    bytes.get(end + 1).is_some_and(u8::is_ascii_alphanumeric)
+}
+
+fn scan_mention_candidates(body: &str) -> Vec<MentionCandidate> {
+    let bytes = body.as_bytes();
+    let mut out = Vec::new();
+    if let Some(end) = nick_span_end(body, 0) {
+        if let Some(&p) = bytes.get(end) {
+            if matches!(p, b':' | b',') {
+                let after = end + 1;
+                let trailing_ok =
+                    after >= bytes.len() || bytes[after].is_ascii_whitespace();
+                if trailing_ok {
+                    out.push(MentionCandidate {
+                        start: 0,
+                        end,
+                        key: body[0..end].to_ascii_lowercase(),
+                        has_at: false,
+                    });
+                }
+            }
+        }
+    }
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'@' {
+            i += 1;
+            continue;
+        }
+        let boundary = i == 0 || !is_nick_char(bytes[i - 1]);
+        if !boundary {
+            i += 1;
+            continue;
+        }
+        let Some(end) = nick_span_end(body, i + 1) else {
+            i += 1;
+            continue;
+        };
+        if looks_like_mxid_tail(body, end) {
+            i = end;
+            continue;
+        }
+        out.push(MentionCandidate {
+            start: i,
+            end,
+            key: body[i + 1..end].to_ascii_lowercase(),
+            has_at: true,
+        });
+        i = end;
+    }
+    out
+}
+
+fn html_escape_into(s: &str, out: &mut String) {
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+}
+
+fn build_mention_html(body: &str, spans: &[MentionSpan]) -> String {
+    let mut out = String::with_capacity(body.len() + spans.len() * 64);
+    let mut i = 0;
+    for s in spans {
+        if s.start > i {
+            html_escape_into(&body[i..s.start], &mut out);
+        }
+        out.push_str("<a href=\"https://matrix.to/#/");
+        html_escape_into(s.mxid.as_str(), &mut out);
+        out.push_str("\">");
+        html_escape_into(&s.pill_text, &mut out);
+        out.push_str("</a>");
+        i = s.end;
+    }
+    if i < body.len() {
+        html_escape_into(&body[i..], &mut out);
+    }
+    out
+}
+
+/// Drops ambiguous keys (>1 member with the same nick) so a typo never pings
+/// the wrong account; callers fall back to plain text on miss.
+async fn member_mention_index(
+    room: &Room,
+) -> HashMap<String, (matrix_sdk::ruma::OwnedUserId, String)> {
+    let Ok(members) = room
+        .members(RoomMemberships::JOIN | RoomMemberships::INVITE)
+        .await
+    else {
+        return HashMap::new();
+    };
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    let mut entries: HashMap<String, (matrix_sdk::ruma::OwnedUserId, String)> =
+        HashMap::new();
+    for m in &members {
+        let mxid = m.user_id().to_owned();
+        let display = m.display_name().map(str::to_string);
+        let pill = display
+            .clone()
+            .unwrap_or_else(|| mxid.localpart().to_string());
+        let mut keys: Vec<String> = Vec::new();
+        if let Some(d) = display.as_deref() {
+            let s = sanitize_nick(d).to_ascii_lowercase();
+            if !s.is_empty() && s != "_" {
+                keys.push(s);
+            }
+        }
+        let local = mxid.localpart().to_ascii_lowercase();
+        if !local.is_empty() {
+            keys.push(local);
+        }
+        for key in keys {
+            *counts.entry(key.clone()).or_insert(0) += 1;
+            entries
+                .entry(key)
+                .or_insert_with(|| (mxid.clone(), pill.clone()));
+        }
+    }
+    counts
+        .into_iter()
+        .filter_map(|(k, n)| {
+            if n == 1 {
+                entries.remove(&k).map(|v| (k, v))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+async fn resolve_mentions(room: &Room, body: &str) -> Vec<MentionSpan> {
+    let candidates = scan_mention_candidates(body);
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let index = member_mention_index(room).await;
+    if index.is_empty() {
+        return Vec::new();
+    }
+    candidates
+        .into_iter()
+        .filter_map(|c| {
+            let (mxid, display) = index.get(&c.key)?;
+            let pill_text = if c.has_at {
+                format!("@{display}")
+            } else {
+                display.clone()
+            };
+            Some(MentionSpan {
+                start: c.start,
+                end: c.end,
+                mxid: mxid.clone(),
+                pill_text,
+            })
+        })
+        .collect()
 }
 
 fn body_from_event(
@@ -258,6 +472,47 @@ async fn find_or_create_dm(client: &Client, mxid: &matrix_sdk::ruma::UserId) -> 
     client.create_dm(mxid).await.context("create_dm")
 }
 
+fn plain_content(body: &str, emote: bool, notice: bool) -> RoomMessageEventContent {
+    if emote {
+        RoomMessageEventContent::emote_plain(body)
+    } else if notice {
+        RoomMessageEventContent::notice_plain(body)
+    } else {
+        RoomMessageEventContent::text_plain(body)
+    }
+}
+
+fn html_content(
+    body: &str,
+    html: String,
+    emote: bool,
+    notice: bool,
+) -> RoomMessageEventContent {
+    if emote {
+        RoomMessageEventContent::emote_html(body, html)
+    } else if notice {
+        RoomMessageEventContent::notice_html(body, html)
+    } else {
+        RoomMessageEventContent::text_html(body, html)
+    }
+}
+
+fn build_outgoing_content(
+    body: &str,
+    mentions: &[MentionSpan],
+    emote: bool,
+    notice: bool,
+) -> RoomMessageEventContent {
+    if mentions.is_empty() {
+        return plain_content(body, emote, notice);
+    }
+    let html = build_mention_html(body, mentions);
+    let mxids: Vec<matrix_sdk::ruma::OwnedUserId> =
+        mentions.iter().map(|m| m.mxid.clone()).collect();
+    html_content(body, html, emote, notice)
+        .add_mentions(Mentions::with_user_ids(mxids))
+}
+
 async fn send_to_room(
     client: &Client,
     bridge: &Bridge,
@@ -270,13 +525,8 @@ async fn send_to_room(
         warn!("matrix room not found: {room_id}");
         return;
     };
-    let content = if emote {
-        RoomMessageEventContent::emote_plain(body)
-    } else if notice {
-        RoomMessageEventContent::notice_plain(body)
-    } else {
-        RoomMessageEventContent::text_plain(body)
-    };
+    let mentions = resolve_mentions(&room, body).await;
+    let content = build_outgoing_content(body, &mentions, emote, notice);
     match room.send(content).await {
         Ok(resp) => bridge.note_sent_by_us(resp.event_id),
         Err(e) => {
@@ -286,6 +536,7 @@ async fn send_to_room(
                 sender_nick: "matrirc".into(),
                 body: format!("[send failed: {e}]"),
                 is_own: false,
+                mentions_self: false,
             });
         }
     }
@@ -743,7 +994,7 @@ pub async fn run_sync(
                 let Some(orig) = ev.as_original() else { return; };
                 let Some((nick, is_own)) = accept_event(&bridge, &room, &orig.event_id, &orig.sender, &own).await else { return; };
                 emit_message(&bridge, room.room_id(), nick,
-                    format!("\x01ACTION reacted {}\x01", orig.content.relates_to.key), is_own);
+                    format!("\x01ACTION reacted {}\x01", orig.content.relates_to.key), is_own, false);
             }
         });
     }
@@ -759,7 +1010,7 @@ pub async fn run_sync(
                 let Some(orig) = ev.as_original() else { return; };
                 let Some((nick, is_own)) = accept_event(&bridge, &room, &orig.event_id, &orig.sender, &own).await else { return; };
                 emit_message(&bridge, room.room_id(), nick,
-                    format!("{C_RED}[encrypted — run `matrirc bootstrap-e2ee` once to decrypt]{C_RESET}"), is_own);
+                    format!("{C_RED}[encrypted — run `matrirc bootstrap-e2ee` once to decrypt]{C_RESET}"), is_own, false);
             }
         });
     }
@@ -830,7 +1081,12 @@ pub async fn run_sync(
                 let Some((nick, is_own)) = accept_event(&bridge, &room, &orig.event_id, &orig.sender, &own).await else { return; };
                 index_attachments(&attach_index, &orig.event_id, &orig.content);
                 let Some(body) = body_from_event(&orig.content, &orig.event_id, &attach_base) else { return; };
-                emit_message(&bridge, room.room_id(), nick, body, is_own);
+                let mentions_self = orig
+                    .content
+                    .mentions
+                    .as_ref()
+                    .is_some_and(|m| m.user_ids.contains(&own));
+                emit_message(&bridge, room.room_id(), nick, body, is_own, mentions_self);
             }
         });
     }
@@ -1187,6 +1443,90 @@ mod tests {
     fn strip_reply_fallback_drops_quoted_header() {
         let src = "> <@a:h> first line\n> second line\n\nactual reply";
         assert_eq!(strip_reply_fallback(src), "actual reply");
+    }
+
+    fn cand(start: usize, end: usize, key: &str, has_at: bool) -> MentionCandidate {
+        MentionCandidate { start, end, key: key.into(), has_at }
+    }
+
+    #[test]
+    fn scan_leading_nick_colon() {
+        let v = scan_mention_candidates("alice: hi");
+        assert_eq!(v, vec![cand(0, 5, "alice", false)]);
+    }
+
+    #[test]
+    fn scan_leading_nick_comma() {
+        let v = scan_mention_candidates("bob, hello");
+        assert_eq!(v, vec![cand(0, 3, "bob", false)]);
+    }
+
+    #[test]
+    fn scan_leading_no_trailing_space() {
+        assert_eq!(scan_mention_candidates("alice:").len(), 1);
+        assert!(scan_mention_candidates("alice:foo").is_empty());
+    }
+
+    #[test]
+    fn scan_at_mention_anywhere() {
+        let v = scan_mention_candidates("hey @bob look");
+        assert_eq!(v, vec![cand(4, 8, "bob", true)]);
+    }
+
+    #[test]
+    fn scan_lowercases_keys() {
+        let v = scan_mention_candidates("Alice: hi");
+        assert_eq!(v, vec![cand(0, 5, "alice", false)]);
+    }
+
+    #[test]
+    fn scan_skips_mxid() {
+        assert!(scan_mention_candidates("see @alice:matrix.org").is_empty());
+    }
+
+    #[test]
+    fn scan_skips_mid_word_at() {
+        assert!(scan_mention_candidates("foo@bar.com").is_empty());
+    }
+
+    #[test]
+    fn scan_combines_leading_and_at() {
+        let v = scan_mention_candidates("alice: ping @bob");
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].key, "alice");
+        assert_eq!(v[1].key, "bob");
+    }
+
+    #[test]
+    fn html_escapes_and_splices() {
+        let mxid = matrix_sdk::ruma::OwnedUserId::try_from("@alice:matrix.org").unwrap();
+        let spans = vec![MentionSpan {
+            start: 0,
+            end: 5,
+            mxid,
+            pill_text: "Alice".into(),
+        }];
+        let html = build_mention_html("alice: <hi>", &spans);
+        assert_eq!(
+            html,
+            r#"<a href="https://matrix.to/#/@alice:matrix.org">Alice</a>: &lt;hi&gt;"#
+        );
+    }
+
+    #[test]
+    fn html_pill_keeps_at_prefix() {
+        let mxid = matrix_sdk::ruma::OwnedUserId::try_from("@bob:matrix.org").unwrap();
+        let spans = vec![MentionSpan {
+            start: 4,
+            end: 8,
+            mxid,
+            pill_text: "@Bob".into(),
+        }];
+        let html = build_mention_html("hey @bob", &spans);
+        assert_eq!(
+            html,
+            r#"hey <a href="https://matrix.to/#/@bob:matrix.org">@Bob</a>"#
+        );
     }
 
     #[test]

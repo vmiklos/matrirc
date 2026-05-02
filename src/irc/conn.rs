@@ -122,6 +122,34 @@ pub async fn handle(sock: TcpStream, peer: SocketAddr, bridge: Bridge) -> Result
     Ok(())
 }
 
+/// Prepends `nick: ` to `body` so irssi's default highlight fires. No-op when
+/// the nick already appears as a standalone token in the body, when the nick
+/// is unknown, or when the body is empty.
+fn ensure_self_mention(body: &str, own_nick: Option<&str>) -> String {
+    let Some(nick) = own_nick else { return body.to_string(); };
+    if nick.is_empty() || body.is_empty() {
+        return body.to_string();
+    }
+    let lower = body.to_ascii_lowercase();
+    let needle = nick.to_ascii_lowercase();
+    let mut search = lower.as_str();
+    let mut offset = 0;
+    while let Some(pos) = search.find(&needle) {
+        let abs = offset + pos;
+        let before_ok = abs == 0
+            || !lower.as_bytes()[abs - 1].is_ascii_alphanumeric();
+        let after = abs + needle.len();
+        let after_ok = after >= lower.len()
+            || !lower.as_bytes()[after].is_ascii_alphanumeric();
+        if before_ok && after_ok {
+            return body.to_string();
+        }
+        offset = abs + 1;
+        search = &lower[offset..];
+    }
+    format!("{nick}: {body}")
+}
+
 async fn handle_matrix_event(
     write: &mut (impl tokio::io::AsyncWrite + Unpin),
     bridge: &Bridge,
@@ -129,20 +157,26 @@ async fn handle_matrix_event(
     ev: FromMatrix,
 ) -> Result<()> {
     match ev {
-        FromMatrix::Message { room, sender_nick, body, is_own } => {
-            let (prefix, target) = if let Some(chan) = bridge.chan_for(&room) {
+        FromMatrix::Message { room, sender_nick, body, is_own, mentions_self } => {
+            let (prefix, target, is_channel) = if let Some(chan) = bridge.chan_for(&room) {
                 if !s.joined.contains(&chan) { return Ok(()); }
-                (format!("{sender_nick}!{sender_nick}@matrix"), chan)
+                (format!("{sender_nick}!{sender_nick}@matrix"), chan, true)
             } else if let Some(peer) = bridge.dm_nick_for(&room) {
                 let Some(n) = s.nick.as_deref() else { return Ok(()); };
                 if is_own {
                     // Own message from another device: ZNC-style self→peer so it
                     // renders in the peer's query window, not a self-query.
-                    (format!("{n}!{n}@matrirc.local"), peer)
+                    (format!("{n}!{n}@matrirc.local"), peer, false)
                 } else {
-                    (format!("{sender_nick}!{sender_nick}@matrix"), n.to_string())
+                    (format!("{sender_nick}!{sender_nick}@matrix"), n.to_string(), false)
                 }
             } else { return Ok(()); };
+            // DM windows already highlight unconditionally; only force-fire on channels.
+            let body = if is_channel && mentions_self && !is_own {
+                ensure_self_mention(&body, s.nick.as_deref())
+            } else {
+                body
+            };
             for piece in body.split('\n').filter(|p| !p.is_empty()) {
                 send(write, Message::with_prefix(&prefix, "PRIVMSG", vec![target.clone(), piece.into()])).await?;
             }
@@ -1123,6 +1157,86 @@ mod tests {
         drain(out).await
     }
 
+    #[test]
+    fn ensure_self_mention_prepends_when_absent() {
+        assert_eq!(
+            ensure_self_mention("hello there", Some("alice")),
+            "alice: hello there"
+        );
+    }
+
+    #[test]
+    fn ensure_self_mention_noop_when_present_as_token() {
+        assert_eq!(
+            ensure_self_mention("hi alice please", Some("alice")),
+            "hi alice please"
+        );
+        assert_eq!(
+            ensure_self_mention("@alice you there?", Some("alice")),
+            "@alice you there?"
+        );
+    }
+
+    #[test]
+    fn ensure_self_mention_ignores_substring_match() {
+        assert_eq!(
+            ensure_self_mention("malice in wonderland", Some("alice")),
+            "alice: malice in wonderland"
+        );
+    }
+
+    #[test]
+    fn ensure_self_mention_case_insensitive() {
+        assert_eq!(
+            ensure_self_mention("Hi Alice!", Some("alice")),
+            "Hi Alice!"
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_mention_self_prepends_nick_when_absent() {
+        let (b, _rx) = Bridge::new(Mapping::default());
+        let r = room("!a:server");
+        b.add_mapping(r.clone(), "#room-a".into(), "topic".into(), &[]);
+        let mut s = registered_state("alice");
+        s.joined.insert("#room-a".into());
+        let out = route(
+            FromMatrix::Message {
+                room: r,
+                sender_nick: "bob".into(),
+                body: "did you see that?".into(),
+                is_own: false,
+                mentions_self: true,
+            },
+            &b, &mut s,
+        ).await;
+        assert!(
+            out.contains("PRIVMSG #room-a :alice: did you see that?"),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_mention_self_skipped_when_nick_already_present() {
+        let (b, _rx) = Bridge::new(Mapping::default());
+        let r = room("!a:server");
+        b.add_mapping(r.clone(), "#room-a".into(), "topic".into(), &[]);
+        let mut s = registered_state("alice");
+        s.joined.insert("#room-a".into());
+        let out = route(
+            FromMatrix::Message {
+                room: r,
+                sender_nick: "bob".into(),
+                body: "alice: ping".into(),
+                is_own: false,
+                mentions_self: true,
+            },
+            &b, &mut s,
+        ).await;
+        assert!(out.contains("PRIVMSG #room-a :alice: ping"), "{out}");
+        assert!(!out.contains("alice: alice:"), "{out}");
+    }
+
     #[tokio::test]
     async fn channel_peer_message() {
         let (b, _rx) = Bridge::new(Mapping::default());
@@ -1131,7 +1245,7 @@ mod tests {
         let mut s = registered_state("alice");
         s.joined.insert("#room-a".into());
         let out = route(
-            FromMatrix::Message { room: r, sender_nick: "alice".into(), body: "hi".into(), is_own: false },
+            FromMatrix::Message { room: r, sender_nick: "alice".into(), body: "hi".into(), is_own: false, mentions_self: false },
             &b, &mut s,
         ).await;
         assert_eq!(out, ":alice!alice@matrix PRIVMSG #room-a hi\r\n");
@@ -1147,7 +1261,7 @@ mod tests {
         }
         let mut s = registered_state("alice");
         let out = route(
-            FromMatrix::Message { room: r, sender_nick: "bob".into(), body: "yo".into(), is_own: false },
+            FromMatrix::Message { room: r, sender_nick: "bob".into(), body: "yo".into(), is_own: false, mentions_self: false },
             &b, &mut s,
         ).await;
         assert_eq!(out, ":bob!bob@matrix PRIVMSG alice yo\r\n");
@@ -1163,7 +1277,7 @@ mod tests {
         }
         let mut s = registered_state("alice");
         let out = route(
-            FromMatrix::Message { room: r, sender_nick: "alice".into(), body: "from other device".into(), is_own: true },
+            FromMatrix::Message { room: r, sender_nick: "alice".into(), body: "from other device".into(), is_own: true, mentions_self: false },
             &b, &mut s,
         ).await;
         assert_eq!(out, ":alice!alice@matrirc.local PRIVMSG bob :from other device\r\n");
@@ -1174,7 +1288,7 @@ mod tests {
         let (b, _rx) = Bridge::new(Mapping::default());
         let mut s = registered_state("alice");
         let out = route(
-            FromMatrix::Message { room: room("!nope:server"), sender_nick: "alice".into(), body: "hi".into(), is_own: false },
+            FromMatrix::Message { room: room("!nope:server"), sender_nick: "alice".into(), body: "hi".into(), is_own: false, mentions_self: false },
             &b, &mut s,
         ).await;
         assert!(out.is_empty(), "expected empty, got {out:?}");
@@ -1187,7 +1301,7 @@ mod tests {
         b.add_mapping(r.clone(), "#room-a".into(), "".into(), &[]);
         let mut s = registered_state("alice"); // no joined insert
         let out = route(
-            FromMatrix::Message { room: r, sender_nick: "alice".into(), body: "hi".into(), is_own: false },
+            FromMatrix::Message { room: r, sender_nick: "alice".into(), body: "hi".into(), is_own: false, mentions_self: false },
             &b, &mut s,
         ).await;
         assert!(out.is_empty(), "expected empty, got {out:?}");
@@ -1330,7 +1444,7 @@ mod tests {
         let mut s = registered_state("alice");
         s.joined.insert("#room-a".into());
         let out = route(
-            FromMatrix::Message { room: r, sender_nick: "alice".into(), body: "one\ntwo".into(), is_own: false },
+            FromMatrix::Message { room: r, sender_nick: "alice".into(), body: "one\ntwo".into(), is_own: false, mentions_self: false },
             &b, &mut s,
         ).await;
         assert!(out.contains("PRIVMSG #room-a one\r\n"));
