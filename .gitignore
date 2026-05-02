@@ -7,3 +7,4 @@ test_resources
 /demo/*
 !/demo/demo.gif
 INTERNALS.md
+/docs/
