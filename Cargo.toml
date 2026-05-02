@@ -4,6 +4,8 @@ version = "0.2.7"
 edition = "2021"
 description = "Local IRC server that bridges to a Matrix homeserver"
 license = "GPL-3.0-or-later"
+repository = "https://github.com/pawelb0/matrirc"
+homepage = "https://github.com/pawelb0/matrirc"
 
 [dependencies]
 tokio = { version = "1", features = [

@@ -1,0 +1,19 @@
+[workspace]
+members = ["cargo:."]
+
+[dist]
+cargo-dist-version = "0.31.0"
+ci = "github"
+installers = ["shell", "homebrew"]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+install-path = "CARGO_HOME"
+hosting = "github"
+install-updater = false
+tap = "pawelb0/homebrew-tap"
+formula = "matrirc"
+pr-run-mode = "plan"
+publish-jobs = ["homebrew"]
