@@ -275,8 +275,6 @@ impl Bridge {
         let _ = self.from_matrix.send(FromMatrix::DmAdded { nick });
     }
 
-    // used by the proxy upload handler
-    #[allow(dead_code)]
     pub fn resolve_scope(&self, name: &str) -> Option<OwnedRoomId> {
         let m = self.mapping.read().unwrap();
         if name.starts_with(['#', '&', '!', '+']) {

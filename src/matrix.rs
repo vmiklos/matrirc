@@ -68,7 +68,7 @@ pub async fn discover_homeserver(http: &reqwest::Client, server_name: &str) -> R
     Ok(wk.homeserver.base_url.trim_end_matches('/').to_string())
 }
 
-/// IRC mIRC colour codes. 14 = grey, 5 = red, 15 = silver. Reset with \x0f.
+// mIRC colour codes; reset with \x0f.
 const C_GREY: &str = "\x0314";
 const C_RED: &str = "\x0305";
 const C_SILVER: &str = "\x0315";
@@ -617,11 +617,8 @@ async fn join_by_alias(
         .ok_or_else(|| "joined but no chan registered (DM detection?)".into())
 }
 
-/// Adds a freshly-joined Matrix room to the bridge mapping. Detects DMs and
-/// uses `add_dm`; otherwise assigns a slug, registers canonical + alt aliases
-/// as extra `chan_to_room` keys, and broadcasts `RoomAdded`. Idempotent for
-/// channels (re-runs return the existing slug from `NameStore`); for DMs,
-/// `add_dm` overwrites with the same canonical nick.
+/// Registers a joined room. DMs route through `add_dm`; channels assign a
+/// slug, register aliases, and broadcast `RoomAdded`. Idempotent.
 async fn register_joined_room(
     client: &Client,
     bridge: &Bridge,
