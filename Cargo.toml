@@ -1,6 +1,6 @@
 [package]
 name = "matrirc"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2021"
 description = "Local IRC server that bridges to a Matrix homeserver"
 license = "GPL-3.0-or-later"
@@ -45,3 +45,7 @@ proptest = "1"
 [profile.release]
 lto = "thin"
 strip = true
+
+[profile.dist]
+inherits = "release"
+lto = "thin"
