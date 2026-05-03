@@ -1,10 +1,7 @@
 /target
 Cargo.lock.bak
-/.claude/
-CLAUDE.md
 test_resources
 /scripts/
 /demo/*
 !/demo/demo.gif
-INTERNALS.md
-/docs/
+
