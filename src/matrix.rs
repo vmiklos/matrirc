@@ -121,6 +121,9 @@ async fn sender_nick(room: &Room, sender: &matrix_sdk::ruma::UserId) -> String {
 const NICK_PUNCT: &str = "-_|[]{}";
 
 fn sanitize_nick(s: &str) -> String {
+    // Remove accents if there are any.
+    let s = unidecode::unidecode(s);
+
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         if c.is_ascii_alphanumeric() || NICK_PUNCT.contains(c) {
@@ -1529,7 +1532,7 @@ mod tests {
     #[test]
     fn sanitize_nick_edges() {
         assert_eq!(sanitize_nick("Alice"), "Alice");
-        assert_eq!(sanitize_nick("Paweł"), "Pawe");
+        assert_eq!(sanitize_nick("Paweł"), "Pawel");
         assert_eq!(sanitize_nick("hi there!"), "hi_there");
         assert_eq!(sanitize_nick("123foo"), "_123foo");
         assert_eq!(sanitize_nick("!!!"), "_");
