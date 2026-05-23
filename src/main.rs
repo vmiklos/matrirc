@@ -52,6 +52,9 @@ async fn run() -> Result<()> {
     let matrix_handle = match config::Config::load(&cfg_path) {
         Ok(cfg) => {
             tracing::info!("matrix: config loaded from {}", cfg_path.display());
+            bridge_state
+                .default_show_reply_ids
+                .store(cfg.show_reply_ids, std::sync::atomic::Ordering::Relaxed);
             let b = bridge_state.clone();
             let ns = name_store.clone();
             let only = env_override_room.clone();

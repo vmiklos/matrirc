@@ -88,11 +88,14 @@ async fn accept_event(
     Some((nick, sender == own))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_message(
     bridge: &Bridge,
     room: &matrix_sdk::ruma::RoomId,
     nick: String,
     body: String,
+    reply_quote: Option<String>,
+    event_id: Option<matrix_sdk::ruma::OwnedEventId>,
     is_own: bool,
     mentions_self: bool,
 ) {
@@ -100,6 +103,8 @@ fn emit_message(
         room: room.to_owned(),
         sender_nick: nick,
         body,
+        event_id,
+        reply_quote,
         is_own,
         mentions_self,
     });
@@ -344,26 +349,109 @@ async fn resolve_mentions(room: &Room, body: &str) -> Vec<MentionSpan> {
         .collect()
 }
 
+/// Decoded message body plus an optional one-line quote of the parent.
+struct DecodedBody {
+    body: String,
+    /// Set when the event is a reply (or non-falling-back thread root). IRC
+    /// layer prints it above the body so irssi shows the threading context.
+    quote: Option<String>,
+}
+
 fn body_from_event(
     content: &RoomMessageEventContent,
     event_id: &matrix_sdk::ruma::EventId,
     attach_base: &str,
-) -> Option<String> {
+) -> Option<DecodedBody> {
     if let Some(Relation::Replacement(repl)) = &content.relates_to {
         let new_body = msgtype_body(&repl.new_content.msgtype, event_id, attach_base)?;
-        return Some(format!("{C_GREY}* edit:{C_RESET} {}", strip_reply_fallback(&new_body)));
+        return Some(DecodedBody {
+            body: format!("{C_GREY}* edit:{C_RESET} {}", strip_reply_fallback(&new_body)),
+            quote: None,
+        });
     }
     let raw = msgtype_body(&content.msgtype, event_id, attach_base)?;
     if matches!(content.msgtype, MessageType::Emote(_)) {
-        return Some(raw);
+        return Some(DecodedBody { body: raw, quote: None });
     }
     let is_reply = matches!(&content.relates_to, Some(Relation::Reply { .. }))
         || matches!(&content.relates_to, Some(Relation::Thread(t)) if !t.is_falling_back);
-    if is_reply {
-        Some(format!("{C_GREY}↳{C_RESET} {}", strip_reply_fallback(&raw)))
-    } else {
-        Some(raw)
+    if !is_reply {
+        return Some(DecodedBody { body: raw, quote: None });
     }
+    let quote = extract_reply_quote(&raw);
+    let clean = strip_reply_fallback(&raw);
+    // When a quote line will be emitted above the body, skip the inline `↳`
+    // marker — past (backfill) and present (live) renders both end up as
+    // "<quote>\n<clean body>" then.
+    let body = if quote.is_some() {
+        clean
+    } else {
+        format!("{C_GREY}↳{C_RESET} {clean}")
+    };
+    Some(DecodedBody { body, quote })
+}
+
+/// Pulls a single-line synopsis out of a matrix reply fallback. Matrix prefixes
+/// the original event's body with `> <@user:server> ...` lines followed by a
+/// blank line and the reply itself; we keep the first non-empty quoted line
+/// (with the MXID compressed to its localpart for readability).
+fn extract_reply_quote(body: &str) -> Option<String> {
+    if !body.starts_with("> ") { return None; }
+    let head = body.split_once("\n\n").map(|(q, _)| q).unwrap_or(body);
+    let line = head.lines().next()?;
+    let stripped = line.trim_start_matches('>').trim();
+    let condensed = stripped
+        .strip_prefix('<')
+        .and_then(|s| s.split_once('>'))
+        .map(|(mxid, rest)| {
+            let nick = mxid_localpart(mxid);
+            format!("<{nick}>{rest}")
+        })
+        .unwrap_or_else(|| stripped.to_string());
+    Some(format!("{C_GREY}↳ {condensed}{C_RESET}"))
+}
+
+/// Strips the leading `{C_GREY}↳{C_RESET} ` we add in `body_from_event` when
+/// the synthesise path later supplies a quote — keeps past/present rendering
+/// consistent (quote above, plain body below).
+fn strip_grey_arrow_prefix(body: String) -> String {
+    let prefix = format!("{C_GREY}↳{C_RESET} ");
+    body.strip_prefix(&prefix).map(str::to_string).unwrap_or(body)
+}
+
+/// Async fallback for replies whose body doesn't carry the matrix `>`-quoted
+/// fallback (matrirc's own pre-fix outbounds, mostly). Fetches the parent
+/// event from the room store and builds a single-line `↳ <sender> snippet`.
+/// Returns `None` if the event isn't a reply, the parent can't be fetched,
+/// or its content isn't a text-like message.
+async fn synthesise_reply_quote(
+    room: &Room,
+    content: &RoomMessageEventContent,
+) -> Option<String> {
+    let target_id = match &content.relates_to {
+        Some(Relation::Reply { in_reply_to }) => in_reply_to.event_id.clone(),
+        Some(Relation::Thread(t)) if !t.is_falling_back => t.in_reply_to.as_ref()?.event_id.clone(),
+        _ => return None,
+    };
+    let evt = room.event(&target_id, None).await.ok()?;
+    let parsed = evt.raw().deserialize().ok()?;
+    let AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
+        SyncMessageLikeEvent::Original(orig),
+    )) = parsed
+    else { return None; };
+    let body = match &orig.content.msgtype {
+        MessageType::Text(t) => t.body.clone(),
+        MessageType::Notice(t) => t.body.clone(),
+        MessageType::Emote(t) => format!("/me {}", t.body),
+        _ => return None,
+    };
+    let first_line = strip_reply_fallback(&body);
+    let snippet = first_line.lines().next().unwrap_or("").trim();
+    if snippet.is_empty() { return None; }
+    let nick = sender_nick(room, &orig.sender).await;
+    let capped: String = snippet.chars().take(60).collect();
+    let suffix = if snippet.chars().count() > 60 { "..." } else { "" };
+    Some(format!("{C_GREY}↳ <{nick}> {capped}{suffix}{C_RESET}"))
 }
 
 fn msgtype_body(
@@ -440,6 +528,7 @@ async fn send_to_mxid(
     body: &str,
     emote: bool,
     notice: bool,
+    in_reply_to: Option<matrix_sdk::ruma::OwnedEventId>,
 ) {
     let room = match find_or_create_dm(client, mxid).await {
         Ok(r) => r,
@@ -457,7 +546,7 @@ async fn send_to_mxid(
     let _ = bridge.from_matrix.send(FromMatrix::DmAdded { nick: nick.clone() });
     let localpart = mxid_localpart(mxid.as_str()).to_string();
     bridge.add_dm(rid.clone(), nick, &[mxid.as_str(), &localpart]);
-    send_to_room(client, bridge, &rid, body, emote, notice).await;
+    send_to_room(client, bridge, &rid, body, emote, notice, in_reply_to).await;
 }
 
 async fn find_or_create_dm(client: &Client, mxid: &matrix_sdk::ruma::UserId) -> Result<Room> {
@@ -516,6 +605,35 @@ fn build_outgoing_content(
         .add_mentions(Mentions::with_user_ids(mxids))
 }
 
+/// Wraps `content` as a reply to `target_id`, populating both the
+/// `m.in_reply_to` relation and the `> <sender> ...\n\nbody` body fallback
+/// (and adding the original author to `m.mentions`). Falls back to a bare
+/// relation when the target event isn't reachable, so we never lose the link.
+async fn build_reply_content(
+    room: &Room,
+    content: RoomMessageEventContent,
+    target_id: &matrix_sdk::ruma::EventId,
+) -> RoomMessageEventContent {
+    use matrix_sdk::ruma::events::room::message::{
+        AddMentions, ForwardThread, SyncRoomMessageEvent,
+    };
+    use matrix_sdk::ruma::events::{AnySyncMessageLikeEvent, AnySyncTimelineEvent};
+    if let Ok(evt) = room.event(target_id, None).await {
+        if let Ok(AnySyncTimelineEvent::MessageLike(
+            AnySyncMessageLikeEvent::RoomMessage(SyncRoomMessageEvent::Original(orig)),
+        )) = evt.raw().deserialize()
+        {
+            let full = orig.into_full_event(room.room_id().to_owned());
+            return content.make_reply_to(&full, ForwardThread::Yes, AddMentions::Yes);
+        }
+    }
+    use matrix_sdk::ruma::events::relation::InReplyTo;
+    use matrix_sdk::ruma::events::room::message::Relation;
+    let mut fallback = content;
+    fallback.relates_to = Some(Relation::Reply { in_reply_to: InReplyTo::new(target_id.to_owned()) });
+    fallback
+}
+
 async fn send_to_room(
     client: &Client,
     bridge: &Bridge,
@@ -523,13 +641,17 @@ async fn send_to_room(
     body: &str,
     emote: bool,
     notice: bool,
+    in_reply_to: Option<matrix_sdk::ruma::OwnedEventId>,
 ) {
     let Some(room) = client.get_room(room_id) else {
         warn!("matrix room not found: {room_id}");
         return;
     };
     let mentions = resolve_mentions(&room, body).await;
-    let content = build_outgoing_content(body, &mentions, emote, notice);
+    let mut content = build_outgoing_content(body, &mentions, emote, notice);
+    if let Some(target) = in_reply_to {
+        content = build_reply_content(&room, content, &target).await;
+    }
     match room.send(content).await {
         Ok(resp) => bridge.note_sent_by_us(resp.event_id),
         Err(e) => {
@@ -538,6 +660,8 @@ async fn send_to_room(
                 room: room_id.to_owned(),
                 sender_nick: "matrirc".into(),
                 body: format!("[send failed: {e}]"),
+                event_id: None,
+                reply_quote: None,
                 is_own: false,
                 mentions_self: false,
             });
@@ -798,11 +922,19 @@ async fn backfill(
                 SyncMessageLikeEvent::Original(orig),
             )) => {
                 index_attachments(attach_index, &orig.event_id, &orig.content);
-                let Some(body) = body_from_event(&orig.content, &orig.event_id, attach_base) else { continue; };
+                let Some(mut decoded) = body_from_event(&orig.content, &orig.event_id, attach_base) else { continue; };
+                if decoded.quote.is_none() {
+                    decoded.quote = synthesise_reply_quote(&room, &orig.content).await;
+                    if decoded.quote.is_some() {
+                        decoded.body = strip_grey_arrow_prefix(decoded.body);
+                    }
+                }
                 out.push(BackfillMessage {
                     sender_nick: sender_nick(&room, &orig.sender).await,
-                    body,
+                    body: decoded.body,
+                    reply_quote: decoded.quote,
                     origin_ms: orig.origin_server_ts.0.into(),
+                    event_id: orig.event_id.clone(),
                     is_own: Some(orig.sender.as_ref()) == client.user_id(),
                 });
             }
@@ -812,7 +944,9 @@ async fn backfill(
                 out.push(BackfillMessage {
                     sender_nick: sender_nick(&room, &orig.sender).await,
                     body: format!("{C_RED}[encrypted — run `matrirc bootstrap-e2ee` to decrypt]{C_RESET}"),
+                    reply_quote: None,
                     origin_ms: orig.origin_server_ts.0.into(),
+                    event_id: orig.event_id.clone(),
                     is_own: Some(orig.sender.as_ref()) == client.user_id(),
                 });
             }
@@ -822,7 +956,9 @@ async fn backfill(
                 out.push(BackfillMessage {
                     sender_nick: sender_nick(&room, &orig.sender).await,
                     body: format!("\x01ACTION reacted {}\x01", orig.content.relates_to.key),
+                    reply_quote: None,
                     origin_ms: orig.origin_server_ts.0.into(),
+                    event_id: orig.event_id.clone(),
                     is_own: Some(orig.sender.as_ref()) == client.user_id(),
                 });
             }
@@ -994,7 +1130,8 @@ pub async fn run_sync(
                 let Some(orig) = ev.as_original() else { return; };
                 let Some((nick, is_own)) = accept_event(&bridge, &room, &orig.event_id, &orig.sender, &own).await else { return; };
                 emit_message(&bridge, room.room_id(), nick,
-                    format!("\x01ACTION reacted {}\x01", orig.content.relates_to.key), is_own, false);
+                    format!("\x01ACTION reacted {}\x01", orig.content.relates_to.key),
+                    None, Some(orig.event_id.clone()), is_own, false);
             }
         });
     }
@@ -1010,7 +1147,8 @@ pub async fn run_sync(
                 let Some(orig) = ev.as_original() else { return; };
                 let Some((nick, is_own)) = accept_event(&bridge, &room, &orig.event_id, &orig.sender, &own).await else { return; };
                 emit_message(&bridge, room.room_id(), nick,
-                    format!("{C_RED}[encrypted — run `matrirc bootstrap-e2ee` once to decrypt]{C_RESET}"), is_own, false);
+                    format!("{C_RED}[encrypted — run `matrirc bootstrap-e2ee` once to decrypt]{C_RESET}"),
+                    None, Some(orig.event_id.clone()), is_own, false);
             }
         });
     }
@@ -1080,13 +1218,20 @@ pub async fn run_sync(
                 let Some(orig) = ev.as_original() else { return; };
                 let Some((nick, is_own)) = accept_event(&bridge, &room, &orig.event_id, &orig.sender, &own).await else { return; };
                 index_attachments(&attach_index, &orig.event_id, &orig.content);
-                let Some(body) = body_from_event(&orig.content, &orig.event_id, &attach_base) else { return; };
+                let Some(mut decoded) = body_from_event(&orig.content, &orig.event_id, &attach_base) else { return; };
+                if decoded.quote.is_none() {
+                    decoded.quote = synthesise_reply_quote(&room, &orig.content).await;
+                    if decoded.quote.is_some() {
+                        decoded.body = strip_grey_arrow_prefix(decoded.body);
+                    }
+                }
                 let mentions_self = orig
                     .content
                     .mentions
                     .as_ref()
                     .is_some_and(|m| m.user_ids.contains(&own));
-                emit_message(&bridge, room.room_id(), nick, body, is_own, mentions_self);
+                emit_message(&bridge, room.room_id(), nick, decoded.body, decoded.quote,
+                    Some(orig.event_id.clone()), is_own, mentions_self);
             }
         });
     }
@@ -1099,11 +1244,11 @@ pub async fn run_sync(
     tokio::spawn(async move {
         while let Some(cmd) = to_matrix.recv().await {
             match cmd {
-                ToMatrix::Send { room, body, emote, notice } => {
-                    send_to_room(&send_client, &send_bridge, &room, &body, emote, notice).await;
+                ToMatrix::Send { room, body, emote, notice, in_reply_to } => {
+                    send_to_room(&send_client, &send_bridge, &room, &body, emote, notice, in_reply_to).await;
                 }
-                ToMatrix::SendToMxid { mxid, body, emote, notice } => {
-                    send_to_mxid(&send_client, &send_bridge, &mxid, &body, emote, notice).await;
+                ToMatrix::SendToMxid { mxid, body, emote, notice, in_reply_to } => {
+                    send_to_mxid(&send_client, &send_bridge, &mxid, &body, emote, notice, in_reply_to).await;
                 }
                 ToMatrix::Backfill { room, limit, reply } => {
                     let result = backfill(&send_client, &room, limit, &attach_base_sender, &attach_index_sender).await;
@@ -1144,6 +1289,24 @@ pub async fn run_sync(
                         }
                     }
                 }
+                ToMatrix::Knock { target, reason, reply } => {
+                    use matrix_sdk::ruma::{OwnedRoomOrAliasId, OwnedServerName};
+                    let result = match OwnedRoomOrAliasId::try_from(target.as_str()) {
+                        Err(e) => Err(format!("bad target: {e}")),
+                        Ok(parsed) => {
+                            let via: Vec<OwnedServerName> = target
+                                .rsplit_once(':')
+                                .and_then(|(_, s)| OwnedServerName::try_from(s).ok())
+                                .into_iter()
+                                .collect();
+                            match send_client.knock(parsed, reason, via).await {
+                                Ok(room) => Ok(format!("knock sent for {}", room.room_id())),
+                                Err(e) => Err(format!("{e:#}")),
+                            }
+                        }
+                    };
+                    let _ = reply.send(result);
+                }
             }
         }
     });
@@ -1181,6 +1344,7 @@ pub async fn login_with_password(
             homeserver_url: homeserver.trim_end_matches('/').to_string(),
             access_token: resp.access_token,
             device_id: resp.device_id.to_string(),
+            show_reply_ids: true,
         },
         client,
     ))
@@ -1200,6 +1364,7 @@ pub async fn login_with_token(homeserver: &str, mxid: &str, token: &str) -> Resu
         homeserver_url: homeserver.trim_end_matches('/').to_string(),
         access_token: token.to_string(),
         device_id,
+        show_reply_ids: true,
     };
     let client = build_client_restored(&cfg).await?;
     Ok((cfg, client))
@@ -1411,16 +1576,16 @@ mod tests {
     fn body_text_and_notice_pass_through() {
         let id = evt("$abc:server.tld");
         let t = content(MessageType::Text(TextMessageEventContent::plain("hi")));
-        assert_eq!(body_from_event(&t, &id, ATTACH).as_deref(), Some("hi"));
+        assert_eq!(body_from_event(&t, &id, ATTACH).map(|d| d.body).as_deref(), Some("hi"));
         let n = content(MessageType::Notice(NoticeMessageEventContent::plain("bye")));
-        assert_eq!(body_from_event(&n, &id, ATTACH).as_deref(), Some("bye"));
+        assert_eq!(body_from_event(&n, &id, ATTACH).map(|d| d.body).as_deref(), Some("bye"));
     }
 
     #[test]
     fn body_emote_wraps_ctcp_action() {
         let id = evt("$abc:server.tld");
         let e = content(MessageType::Emote(EmoteMessageEventContent::plain("waves")));
-        assert_eq!(body_from_event(&e, &id, ATTACH).as_deref(), Some("\x01ACTION waves\x01"));
+        assert_eq!(body_from_event(&e, &id, ATTACH).map(|d| d.body).as_deref(), Some("\x01ACTION waves\x01"));
     }
 
     #[test]
@@ -1428,7 +1593,7 @@ mod tests {
         let id = evt("$abc:server.tld");
         let mxc = OwnedMxcUri::from("mxc://example.org/abc123");
         let img = content(MessageType::Image(ImageMessageEventContent::plain("kitten.png".into(), mxc)));
-        let out = body_from_event(&img, &id, ATTACH).unwrap();
+        let out = body_from_event(&img, &id, ATTACH).unwrap().body;
         assert!(out.contains("[image]"), "{out}");
         assert!(out.contains("kitten.png"), "{out}");
         assert!(out.contains("http://127.0.0.1:6680/attach/$abc:server.tld"), "{out}");

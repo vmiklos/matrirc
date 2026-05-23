@@ -9,7 +9,14 @@ pub struct Config {
     pub homeserver_url: String,
     pub access_token: String,
     pub device_id: String,
+    /// Emit IRCv3 `msgid` tag on inbound matrix messages so reply ids can be
+    /// resolved via `!r <id> <text>`. `true` by default; a per-connection bot
+    /// command (`/msg matrirc ids on|off`) overrides at runtime.
+    #[serde(default = "default_true")]
+    pub show_reply_ids: bool,
 }
+
+fn default_true() -> bool { true }
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
@@ -75,6 +82,7 @@ mod tests {
             homeserver_url: "https://matrix.example.org".into(),
             access_token: "secret123".into(),
             device_id: "DEVABC".into(),
+            show_reply_ids: true,
         };
         cfg.save(&path).unwrap();
         let loaded = Config::load(&path).unwrap();
@@ -92,6 +100,7 @@ mod tests {
             homeserver_url: "https://y".into(),
             access_token: "t".into(),
             device_id: "D".into(),
+            show_reply_ids: true,
         };
         cfg.save(&path).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;

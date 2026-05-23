@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, RwLock};
 
 use matrix_sdk::ruma::{EventId, OwnedEventId, OwnedRoomId, OwnedUserId, RoomId};
@@ -85,6 +86,14 @@ pub enum FromMatrix {
         room: OwnedRoomId,
         sender_nick: String,
         body: String,
+        /// Source Matrix event id. Used by IRC layer to assign a short reply id
+        /// and resolve `!r <id>` back to `m.in_reply_to`. `None` for synthetic
+        /// messages (e.g. a failed-send notice) where no event exists.
+        event_id: Option<OwnedEventId>,
+        /// One-line quote of the message this is a reply to. IRC layer prints
+        /// it as a separate PRIVMSG above the body so the conversation thread
+        /// is readable in irssi.
+        reply_quote: Option<String>,
         /// True when the sender is the logged-in user (message originated on
         /// another device). Lets IRC conn route as `self→peer` for DMs.
         is_own: bool,
@@ -130,12 +139,14 @@ pub enum ToMatrix {
         body: String,
         emote: bool,
         notice: bool,
+        in_reply_to: Option<OwnedEventId>,
     },
     SendToMxid {
         mxid: OwnedUserId,
         body: String,
         emote: bool,
         notice: bool,
+        in_reply_to: Option<OwnedEventId>,
     },
     Backfill {
         room: OwnedRoomId,
@@ -170,13 +181,20 @@ pub enum ToMatrix {
         room: OwnedRoomId,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    Knock {
+        target: String,
+        reason: Option<String>,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub struct BackfillMessage {
     pub sender_nick: String,
     pub body: String,
+    pub reply_quote: Option<String>,
     pub origin_ms: i64,
+    pub event_id: OwnedEventId,
     /// True when sender is the logged-in user. DM backfill drops these
     /// because IRC can't emit "self→peer" without echo-message.
     pub is_own: bool,
@@ -204,6 +222,10 @@ pub struct Bridge {
     pub from_matrix: broadcast::Sender<FromMatrix>,
     pub to_matrix: mpsc::Sender<ToMatrix>,
     recent_sent: Arc<Mutex<VecDeque<OwnedEventId>>>,
+    /// Server-wide default for reply-id emission; new IRC connections snapshot
+    /// this at register time and can flip their per-connection copy via the
+    /// `ids` bot command.
+    pub default_show_reply_ids: Arc<AtomicBool>,
 }
 
 impl Bridge {
@@ -216,6 +238,7 @@ impl Bridge {
                 from_matrix: from_tx,
                 to_matrix: to_tx,
                 recent_sent: Arc::new(Mutex::new(VecDeque::with_capacity(RECENT_SENT_CAP))),
+                default_show_reply_ids: Arc::new(AtomicBool::new(true)),
             },
             to_rx,
         )
