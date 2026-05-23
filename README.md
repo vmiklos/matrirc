@@ -112,8 +112,49 @@ Once connected, from inside irssi:
 
 - `/msg matrirc help` — full command reference
 - `/msg matrirc search <term>` — public-room directory search
+- `/msg matrirc join <#alias:server | !room:server>` — join by alias or room id
+- `/msg matrirc knock <target> [reason]` — knock on an invite-only room
+- `/msg matrirc dump <#chan or peer>` — inspect the reply-id ring
+- `/msg matrirc ids on|off|toggle|status` — toggle reply-id tags (default on)
 - `/join #alias:server.org` — join any public Matrix room
 - `/msg @alice:server.org hi` — open or create a DM
+- `!r <id> text` — reply to message `[id]` in the current window
+
+`/part` of a bridged channel calls Matrix `leave`. To force a fresh
+backfill without leaving, `/disconnect matrirc` and reconnect instead.
+
+## Replies
+
+Each inbound Matrix message gets a 3-letter id (FNV hash of the event
+id, stable across daemon restarts). The id rides on the IRCv3 `msgid`
+tag; the autoinstalled `matrirc.pl` script renders it inline:
+
+```
+14:33 alice | [abc] could you take a look at this?
+```
+
+Reply with `!r <id> body`:
+
+```
+!r abc on it
+```
+
+matrirc resolves the short to a Matrix event id, builds an
+`m.in_reply_to` relation with the body fallback (so Element threads it
+correctly), and sends. The reply line also renders a quote above the
+body in your IRC window.
+
+Mis-typed id → message is dropped and matrirc sends a notice to your
+`matrirc` bot window.
+
+Turn it off:
+
+```
+/msg matrirc ids off
+```
+
+Or set `show_reply_ids = false` in `config.toml` for the daemon
+default.
 
 ## How it works
 

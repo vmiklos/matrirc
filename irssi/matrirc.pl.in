@@ -149,6 +149,169 @@ sub stop {
     kill_daemon_if_ours();
 }
 
+# --- IRCv3 msgid rendering -----------------------------------------------
+# Reads matrirc's `@msgid=...` tag and prefixes `[xxxx]` on incoming bodies
+# so the user can target replies with `!r <id> <text>`. `/set matrirc_msgid_debug ON`
+# logs signal traffic.
+Irssi::settings_add_bool('matrirc', 'matrirc_msgid_debug', 0);
+sub msgid_debug { Irssi::settings_get_bool('matrirc_msgid_debug') }
+
+# irssi blesses a fresh `$server` per signal call, so attributes hung off
+# `$server->{...}` don't survive between handlers. Use a script-lexical hash
+# keyed by `server->{tag}` instead.
+my %msgid_pending;
+sub msgid_state_key { $_[0]->{tag} . '|' . $_[1] }
+
+# matrirc accepts CAP REQ post-registration; server-time is enough because
+# matrirc silently bundles message-tags into the ACK.
+sub msgid_on_welcome {
+    my ($server) = @_;
+    return unless $server;
+    # Skip echo-message: irssi's local-echo suppression is unreliable and
+    # users end up seeing every outbound line twice. The reply-quote line
+    # comes through a NOTICE path that doesn't need echo-message.
+    $server->send_raw_now('CAP REQ :server-time message-tags');
+}
+
+# Queue msgid per stream (channel for pubmsg, sender-nick for DM). Ordering
+# stays in sync because irssi processes each incoming line synchronously:
+# server_incoming → message_public / message_private. Don't key on body —
+# irssi may trim/normalise before the message signal fires.
+sub msgid_queue_key {
+    my ($target, $nick) = @_;
+    # Include sender in the channel key so your own echo-message bounces
+    # (untagged, key=chan|#room|self) can't pop a remote sender's queue.
+    return substr($target, 0, 1) eq '#'
+        ? 'chan|' . lc($target) . '|' . lc($nick)
+        : 'dm|' . lc($nick);
+}
+
+sub msgid_unescape_tag {
+    my ($v) = @_;
+    $v =~ s/\\:/;/g; $v =~ s/\\s/ /g; $v =~ s/\\\\/\\/g;
+    $v =~ s/\\r/\r/g; $v =~ s/\\n/\n/g;
+    $v;
+}
+
+sub msgid_on_server_incoming {
+    my ($server, $line) = @_;
+    return unless defined $line && substr($line, 0, 1) eq '@';
+    return unless $line =~ /^@([^ ]+)\s+:([^!\s]+)\S*\s+PRIVMSG\s+(\S+)(?:\s+:?(.*))?$/;
+    my ($tags, $nick, $target, $body) = ($1, $2, $3, $4);
+    # CTCP (`\x01`-wrapped) bodies route through `message irc action` / other
+    # signals, not `message public/private`. Pushing here would leave the
+    # msgid permanently unpopped → every later event displays the previous
+    # one's id.
+    if (defined $body && substr($body, 0, 1) eq "\x01") {
+        return;
+    }
+    # ZNC-style DM replays (sender == own nick, target is our own nick or any
+    # non-channel) crash irssi's query_find on signal_continue. For channels
+    # they're harmless — own messages should render with `[id]` so the user
+    # can target their own messages via `!r`.
+    if (defined $server->{nick}
+        && lc($nick) eq lc($server->{nick})
+        && substr($target, 0, 1) ne '#')
+    {
+        return;
+    }
+    my $id;
+    for my $kv (split /;/, $tags) {
+        my ($k, $v) = split /=/, $kv, 2;
+        if ($k eq 'msgid' && defined $v && length $v) { $id = msgid_unescape_tag($v); last; }
+    }
+    return unless defined $id;
+    my $key = msgid_queue_key($target, $nick);
+    push @{$msgid_pending{msgid_state_key($server, $key)}}, $id;
+    Irssi::print("msgid push: key=$key id=$id (from $nick → $target)") if msgid_debug();
+}
+
+sub msgid_pop {
+    my ($server, $key) = @_;
+    my $q = $msgid_pending{msgid_state_key($server, $key)} or return;
+    return shift @$q;
+}
+
+sub msgid_rewrite_public {
+    my ($server, $msg, $nick, $address, $target) = @_;
+    my $key = 'chan|' . lc($target) . '|' . lc($nick);
+    my $id = msgid_pop($server, $key);
+    Irssi::print("pubmsg: key=$key id=" . (defined $id ? $id : '(none)') . " nick=$nick")
+        if msgid_debug();
+    return unless defined $id;
+    Irssi::signal_continue($server, "[$id] $msg", $nick, $address, $target);
+}
+
+sub msgid_rewrite_private {
+    my ($server, $msg, $nick, $address, $target) = @_;
+    my $key = 'dm|' . lc($nick);
+    my $id = msgid_pop($server, $key);
+    Irssi::print("privmsg: key=$key id=" . (defined $id ? $id : '(none)') . " nick=$nick")
+        if msgid_debug();
+    return unless defined $id;
+    # `message private` carries five args in modern irssi; pass `target` along
+    # so downstream handlers don't read garbage for the fifth parameter.
+    Irssi::signal_continue($server, "[$id] $msg", $nick, $address, $target);
+}
+
+# Own messages in channels arrive on `message own_public` instead of
+# `message public`. Pop the same per-(target, own-nick) queue so backfilled
+# pawelb-in-#chan lines render `[id]` just like everyone else's.
+sub msgid_rewrite_own_public {
+    my ($server, $msg, $target, $orig_target) = @_;
+    my $own = $server->{nick};
+    return unless defined $own;
+    my $key = 'chan|' . lc($target) . '|' . lc($own);
+    my $id = msgid_pop($server, $key);
+    Irssi::print("own_pubmsg: key=$key id=" . (defined $id ? $id : '(none)'))
+        if msgid_debug();
+    return unless defined $id;
+    Irssi::signal_continue($server, "[$id] $msg", $target, $orig_target);
+}
+
+sub msgid_rewrite_irc_action {
+    my ($server, $msg, $nick, $address, $target) = @_;
+    # Match the same per-stream key as on_server_incoming, but actions are
+    # CTCP-wrapped — we skipped the push for them, so this pop will normally
+    # return undef. Kept symmetric in case a future change re-enables it.
+    my $key = substr($target, 0, 1) eq '#'
+        ? 'chan|' . lc($target) . '|' . lc($nick)
+        : 'dm|' . lc($nick);
+    my $id = msgid_pop($server, $key);
+    Irssi::print("action: key=$key id=" . (defined $id ? $id : '(none)') . " nick=$nick")
+        if msgid_debug();
+    return unless defined $id;
+    Irssi::signal_continue($server, "[$id] $msg", $nick, $address, $target);
+}
+
+Irssi::signal_add_first('event 001',             \&msgid_on_welcome);
+Irssi::signal_add_first('server incoming',       \&msgid_on_server_incoming);
+Irssi::signal_add_first('message public',        \&msgid_rewrite_public);
+Irssi::signal_add_first('message private',       \&msgid_rewrite_private);
+Irssi::signal_add_first('message own_public',    \&msgid_rewrite_own_public);
+Irssi::signal_add_first('message irc action',    \&msgid_rewrite_irc_action);
+
+# Mid-session reloads miss event 001, so REQ caps for live servers now.
+for my $s (Irssi::servers()) {
+    msgid_on_welcome($s) if $s->{connected};
+}
+# --- end IRCv3 msgid rendering -------------------------------------------
+
+# Cheat sheet printed on script load so the same hints are visible whether you
+# saw the MOTD or just `/script load`ed.
+sub print_cheatsheet {
+    Irssi::print('matrirc commands:');
+    Irssi::print('  /msg matrirc help                  bot help');
+    Irssi::print('  /msg matrirc rooms | dms           list bridged channels / DMs');
+    Irssi::print('  /msg matrirc search <term>         public-room directory');
+    Irssi::print('  /msg matrirc ids on|off|toggle     IRCv3 msgid tag for !r replies');
+    Irssi::print('  /join #alias:server.org            join matrix room');
+    Irssi::print('  /msg @user:server hi               DM by mxid');
+    Irssi::print('  !r <id> text                       reply to message [id]');
+    Irssi::print('  /join #echo                        local echo bot for testing');
+}
+print_cheatsheet();
+
 Irssi::signal_add_last('script unload' => sub {
     my ($script) = @_;
     return unless $script->{name} eq $IRSSI{name};
