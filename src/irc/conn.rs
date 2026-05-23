@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
@@ -63,12 +63,32 @@ mod rpl {
 const ECHO_NICK: &str = "echo";
 const ECHO_PREFIX: &str = "echo!echo@matrirc.local";
 const ECHO_CHAN: &str = "#echo";
+
+/// One-line summaries of the `/msg matrirc <cmd>` surface. Shared between the
+/// `help` bot output and the MOTD cheat-sheet so they can't drift apart.
+const BOT_CMDS: &[&str] = &[
+    "help                          this message",
+    "rooms                         list bridged Matrix channels",
+    "dms                           list known Matrix DMs",
+    "search <term> [on <server>]   public-room directory",
+    "join <!room:server | #alias>  join a matrix room by id or alias",
+    "knock <target> [reason]       knock on an invite-only room",
+    "ids [on|off|toggle|status]    toggle IRCv3 msgid tag for !r replies",
+    "dump <window>                 show the reply-id ring for #chan or peer",
+    "version                       matrirc version",
+];
 const ECHO_TOPIC: &str = "Echo channel — anything you say, echo will say back";
 const BOT_PREFIX: &str = "matrirc!matrirc@matrirc.local";
 
 fn user_prefix(nick: &str) -> String {
     format!("{nick}!{nick}@matrirc.local")
 }
+
+/// (short_id, event_id, sender_nick, body_snippet) tuples per window. The
+/// snippet and sender let the outbound `!r` path render a quote line in the
+/// echo-message bounce so the user sees what they replied to.
+type ReplyEntry = (String, matrix_sdk::ruma::OwnedEventId, String, String);
+type ReplyRing = HashMap<String, VecDeque<ReplyEntry>>;
 
 #[derive(Default)]
 struct State {
@@ -79,13 +99,152 @@ struct State {
     caps: HashSet<String>,
     dm_backfilled: HashSet<matrix_sdk::ruma::OwnedRoomId>,
     dm_hinted: HashSet<matrix_sdk::ruma::OwnedRoomId>,
+    /// Per-target ring (channel slug or peer nick, ASCII-lowercased) →
+    /// recent (short_id, event_id) pairs. Lets `!r <id>` resolve back to a
+    /// Matrix event for `m.in_reply_to`.
+    reply_ids: ReplyRing,
+    /// Emit IRCv3 `msgid` tag on inbound matrix messages. Toggled at runtime
+    /// via the `ids` bot command; initial value comes from
+    /// `Bridge::default_show_reply_ids`.
+    show_reply_ids: bool,
+    /// Monotonic counter feeding synthesised event ids for `#echo` replies,
+    /// so the test bot exercises the same msgid/!r flow as Matrix.
+    echo_counter: u64,
+}
+
+fn synth_echo_event_id(counter: &mut u64) -> matrix_sdk::ruma::OwnedEventId {
+    *counter += 1;
+    let s = format!("$echo{counter}:matrirc.local");
+    matrix_sdk::ruma::OwnedEventId::try_from(s.as_str()).expect("synthetic echo event id parses")
+}
+
+const REPLY_RING_CAP: usize = 64;
+/// IRC frames cap at 512 bytes including framing and CRLF. 400 leaves room
+/// for any reasonable `:nick!nick@matrix PRIVMSG <target> :` prefix plus tags.
+const SAFE_BODY_BYTES: usize = 400;
+
+/// 3-letter short id derived from a Matrix event id via FNV-1a → base-26
+/// (a-z) over 17 576 slots. Deterministic: the same event id always renders
+/// the same short across daemon restarts. Collisions are handled by
+/// `lookup_reply_id` walking newest-first (latest match wins).
+fn short_event_id(id: &matrix_sdk::ruma::EventId) -> String {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in id.as_str().bytes() {
+        h ^= u32::from(b);
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    let mut v = (h as usize) % (26 * 26 * 26);
+    let mut buf = [b'a'; 3];
+    for slot in buf.iter_mut().rev() {
+        *slot = b'a' + (v % 26) as u8;
+        v /= 26;
+    }
+    String::from_utf8(buf.to_vec()).expect("ascii bytes")
+}
+
+fn remember_reply_id(
+    ring: &mut ReplyRing,
+    target: &str,
+    event_id: matrix_sdk::ruma::OwnedEventId,
+    sender: String,
+    snippet: String,
+) -> String {
+    let short = short_event_id(&event_id);
+    let q = ring.entry(target.to_ascii_lowercase()).or_default();
+    if q.len() >= REPLY_RING_CAP { q.pop_front(); }
+    q.push_back((short.clone(), event_id, sender, snippet));
+    short
+}
+
+fn lookup_reply_id(
+    ring: &ReplyRing,
+    target: &str,
+    short: &str,
+) -> Option<(matrix_sdk::ruma::OwnedEventId, String, String)> {
+    let q = ring.get(&target.to_ascii_lowercase())?;
+    // Walk newest-first explicitly so the latest entry sharing `short` wins
+    // (relevant only on hash collisions, but worth pinning the behaviour down).
+    for entry in q.iter().rev() {
+        if entry.0 == short {
+            return Some((entry.1.clone(), entry.2.clone(), entry.3.clone()));
+        }
+    }
+    None
+}
+
+/// First non-empty line of `body`, trimmed and capped — used as the quoted
+/// snippet in outbound reply echoes. Strips colour codes that would corrupt
+/// the IRC line when prepended verbatim.
+fn body_snippet(body: &str) -> String {
+    let line = body.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    let stripped: String = line.chars().filter(|c| !matches!(*c as u32, 0..=0x1f)).collect();
+    if stripped.chars().count() <= 60 {
+        stripped
+    } else {
+        let mut out: String = stripped.chars().take(57).collect();
+        out.push_str("...");
+        out
+    }
+}
+
+fn flatten_newlines(body: &str) -> String {
+    body.replace('\n', " ↵ ")
+}
+
+/// Splits `body` at byte budgets ≤ `SAFE_BODY_BYTES`, keeping UTF-8 boundaries
+/// and preferring whitespace breaks. Single-element vec when already fits.
+fn chunk_for_irc(body: &str) -> Vec<String> {
+    if body.len() <= SAFE_BODY_BYTES {
+        return vec![body.to_string()];
+    }
+    let mut out = Vec::new();
+    let mut rest = body;
+    while rest.len() > SAFE_BODY_BYTES {
+        let mut split = SAFE_BODY_BYTES;
+        while !rest.is_char_boundary(split) { split -= 1; }
+        if let Some(ws) = rest[..split].rfind(char::is_whitespace) {
+            split = ws.max(1);
+        }
+        let (head, tail) = rest.split_at(split);
+        out.push(head.trim_end().to_string());
+        rest = tail.trim_start();
+    }
+    if !rest.is_empty() { out.push(rest.to_string()); }
+    out
+}
+
+/// Flattens, chunks, and (when reply ids are enabled and `event_id` is set)
+/// stashes the short id + sender/snippet in the ring. Returns
+/// `(short_id, pieces)`; the caller attaches `short_id` as the IRCv3 `msgid`
+/// tag on the first PRIVMSG so client scripts can render it between time and
+/// nick.
+#[allow(clippy::too_many_arguments)]
+fn make_payloads(
+    body: &str,
+    sender: &str,
+    event_id: Option<matrix_sdk::ruma::OwnedEventId>,
+    ring_key: &str,
+    ring: &mut ReplyRing,
+    show_reply_ids: bool,
+) -> (Option<String>, Vec<String>) {
+    let flattened = flatten_newlines(body);
+    if flattened.is_empty() { return (None, Vec::new()); }
+    let short = (show_reply_ids).then(|| event_id.map(|eid| {
+        remember_reply_id(ring, ring_key, eid, sender.to_string(), body_snippet(body))
+    })).flatten();
+    (short, chunk_for_irc(&flattened))
 }
 
 pub async fn handle(sock: TcpStream, peer: SocketAddr, bridge: Bridge) -> Result<()> {
     let (read, mut write) = sock.into_split();
     let mut lines = BufReader::new(read).lines();
     let mut from_matrix = bridge.from_matrix.subscribe();
-    let mut s = State::default();
+    let mut s = State {
+        show_reply_ids: bridge
+            .default_show_reply_ids
+            .load(std::sync::atomic::Ordering::Relaxed),
+        ..State::default()
+    };
 
     loop {
         tokio::select! {
@@ -157,18 +316,20 @@ async fn handle_matrix_event(
     ev: FromMatrix,
 ) -> Result<()> {
     match ev {
-        FromMatrix::Message { room, sender_nick, body, is_own, mentions_self } => {
-            let (prefix, target, is_channel) = if let Some(chan) = bridge.chan_for(&room) {
+        FromMatrix::Message { room, sender_nick, body, event_id, reply_quote, is_own, mentions_self } => {
+            let (prefix, target, is_channel, ring_key) = if let Some(chan) = bridge.chan_for(&room) {
                 if !s.joined.contains(&chan) { return Ok(()); }
-                (format!("{sender_nick}!{sender_nick}@matrix"), chan, true)
+                let key = chan.clone();
+                (format!("{sender_nick}!{sender_nick}@matrix"), chan, true, key)
             } else if let Some(peer) = bridge.dm_nick_for(&room) {
                 let Some(n) = s.nick.as_deref() else { return Ok(()); };
+                let key = peer.clone();
                 if is_own {
                     // Own message from another device: ZNC-style self→peer so it
                     // renders in the peer's query window, not a self-query.
-                    (format!("{n}!{n}@matrirc.local"), peer, false)
+                    (format!("{n}!{n}@matrirc.local"), peer, false, key)
                 } else {
-                    (format!("{sender_nick}!{sender_nick}@matrix"), n.to_string(), false)
+                    (format!("{sender_nick}!{sender_nick}@matrix"), n.to_string(), false, key)
                 }
             } else { return Ok(()); };
             // DM windows already highlight unconditionally; only force-fire on channels.
@@ -177,14 +338,28 @@ async fn handle_matrix_event(
             } else {
                 body
             };
-            for piece in body.split('\n').filter(|p| !p.is_empty()) {
-                send(write, Message::with_prefix(&prefix, "PRIVMSG", vec![target.clone(), piece.into()])).await?;
+            if let Some(q) = reply_quote {
+                send(write, Message::with_prefix(&prefix, "PRIVMSG", vec![target.clone(), q])).await?;
+            }
+            let (msgid, pieces) = make_payloads(
+                &body, &sender_nick, event_id, &ring_key, &mut s.reply_ids, s.show_reply_ids,
+            );
+            for (i, payload) in pieces.into_iter().enumerate() {
+                let mut out = Message::with_prefix(&prefix, "PRIVMSG", vec![target.clone(), payload]);
+                if i == 0 {
+                    if let Some(id) = &msgid {
+                        if s.caps.contains(MESSAGE_TAGS_CAP) {
+                            out = out.with_tag("msgid", id.clone());
+                        }
+                    }
+                }
+                send(write, out).await?;
             }
         }
         FromMatrix::RoomAdded { room, chan, topic } => {
             if !s.registered || s.joined.contains(&chan) { return Ok(()); }
             if let Some(n) = s.nick.as_deref() {
-                join_bridged(write, n, &chan, &room, &topic, bridge, &s.caps).await?;
+                join_bridged(write, n, &chan, &room, &topic, bridge, &s.caps, &mut s.reply_ids, s.show_reply_ids).await?;
                 s.joined.insert(chan);
             }
         }
@@ -253,7 +428,7 @@ async fn handle_command(
         "USER" => if let Some(u) = p0 { s.user = Some(u.into()); },
         "PING" => send(write, srv("PONG", vec![SERVER_NAME.into(), p0.unwrap_or("").into()])).await?,
         "JOIN" => if let Some(n) = s.nick.clone() {
-            handle_join(write, &n, msg, &mut s.joined, bridge, &s.caps).await?;
+            handle_join(write, &n, msg, &mut s.joined, bridge, &s.caps, &mut s.reply_ids, s.show_reply_ids).await?;
         },
         "PART" => if let Some(n) = s.nick.clone() {
             handle_part(write, &n, msg, &mut s.joined, bridge).await?;
@@ -355,6 +530,7 @@ async fn handle_cap(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_join(
     write: &mut (impl tokio::io::AsyncWrite + Unpin),
     nick: &str,
@@ -362,6 +538,8 @@ async fn handle_join(
     joined: &mut HashSet<String>,
     bridge: &Bridge,
     caps: &HashSet<String>,
+    reply_ids: &mut ReplyRing,
+    show_reply_ids: bool,
 ) -> Result<()> {
     let Some(target) = msg.params.first() else { return Ok(()); };
     for chan in target.split(',') {
@@ -382,7 +560,7 @@ async fn handle_join(
             }
             if joined.insert(canonical.clone()) {
                 let topic = bridge.topic_for(&canonical).unwrap_or_default();
-                join_bridged(write, nick, &canonical, &room, &topic, bridge, caps).await?;
+                join_bridged(write, nick, &canonical, &room, &topic, bridge, caps, reply_ids, show_reply_ids).await?;
             }
             continue;
         }
@@ -437,6 +615,7 @@ async fn join_echo(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // wraps existing wide signature plus reply-id state.
 async fn join_bridged(
     write: &mut (impl tokio::io::AsyncWrite + Unpin),
     nick: &str,
@@ -445,11 +624,13 @@ async fn join_bridged(
     topic: &str,
     bridge: &Bridge,
     caps: &HashSet<String>,
+    reply_ids: &mut ReplyRing,
+    show_reply_ids: bool,
 ) -> Result<()> {
     let members = fetch_members(bridge, room).await;
     let names: Vec<&str> = members.iter().map(String::as_str).collect();
     send_join(write, nick, chan, topic, &names).await?;
-    backfill_channel(write, chan, room, bridge, caps).await?;
+    backfill_channel(write, chan, room, bridge, caps, reply_ids, show_reply_ids).await?;
     Ok(())
 }
 
@@ -549,16 +730,17 @@ async fn auto_join_all(
         &format!("channels: {chan_list}  |  DMs: {dm_list}"),
     ).await?;
 
-    for (chan, room) in new_joins {
-        backfill_channel(write, &chan, &room, bridge, &s.caps).await?;
-    }
-    // Eager DM backfill: populates one query window per DM under the canonical
-    // peer nick. Otherwise irssi has nothing to display until first message.
+    // DMs first: usually small + the user wants to see /query windows populated
+    // immediately. A noisy channel's 1000-event backfill would otherwise block
+    // DM history for tens of seconds.
     for (room, dm_nick) in dms {
         if s.dm_backfilled.insert(room.clone()) {
             let _ = dm_nick; // peer nick lands in backfill's own prefixes
-            backfill_channel(write, nick, &room, bridge, &s.caps).await?;
+            backfill_channel(write, nick, &room, bridge, &s.caps, &mut s.reply_ids, s.show_reply_ids).await?;
         }
+    }
+    for (chan, room) in new_joins {
+        backfill_channel(write, &chan, &room, bridge, &s.caps, &mut s.reply_ids, s.show_reply_ids).await?;
     }
     Ok(())
 }
@@ -584,33 +766,29 @@ async fn handle_bot_command(
     nick: &str,
     text: &str,
     bridge: &Bridge,
+    s: &mut State,
 ) -> Result<()> {
     let cmd = text.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
     match cmd.as_str() {
         "" | "help" | "?" => {
-            for line in [
-                "matrirc — local Matrix↔IRC bridge",
-                "",
-                "bot commands (to this nick):",
-                "  help                          this message",
-                "  rooms                         list bridged Matrix channels",
-                "  dms                           list known Matrix DMs",
-                "  search <term> [on <server>]   public-room directory",
-                "  version                       matrirc version",
-                "",
-                "IRC → Matrix:",
-                "  /join #alias:server.org       join any public Matrix room",
-                "  /msg @alice:server.org hi     open/create a DM",
-                "  /msg <known-dm-nick> hi       existing DM (see `dms`)",
-                "  /part #channel                leave the IRC channel (Matrix room keeps you)",
-                "  /me does a thing              m.emote",
-                "",
-                "daemon control (in your shell, not here):",
-                "  matrirc status | stop | verify | reset",
-                "docs: https://github.com/pawelb0/matrirc",
-            ] {
-                matrirc_msg(write, nick, line).await?;
+            matrirc_msg(write, nick, "matrirc — local Matrix↔IRC bridge").await?;
+            matrirc_msg(write, nick, "").await?;
+            matrirc_msg(write, nick, "bot commands (to this nick):").await?;
+            for line in BOT_CMDS {
+                matrirc_msg(write, nick, &format!("  {line}")).await?;
             }
+            matrirc_msg(write, nick, "").await?;
+            matrirc_msg(write, nick, "IRC → Matrix:").await?;
+            matrirc_msg(write, nick, "  /join #alias:server.org       join any public Matrix room").await?;
+            matrirc_msg(write, nick, "  /msg @alice:server.org hi     open/create a DM").await?;
+            matrirc_msg(write, nick, "  /msg <known-dm-nick> hi       existing DM (see `dms`)").await?;
+            matrirc_msg(write, nick, "  /part #channel                leave the IRC channel (Matrix room keeps you)").await?;
+            matrirc_msg(write, nick, "  /me does a thing              m.emote").await?;
+            matrirc_msg(write, nick, "  !r <id> text                  reply to message [id] in this window").await?;
+            matrirc_msg(write, nick, "").await?;
+            matrirc_msg(write, nick, "daemon control (in your shell, not here):").await?;
+            matrirc_msg(write, nick, "  matrirc status | stop | verify | reset").await?;
+            matrirc_msg(write, nick, "docs: https://github.com/pawelb0/matrirc").await?;
         }
         "search" => {
             let rest = text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
@@ -670,6 +848,100 @@ async fn handle_bot_command(
             )
             .await?;
         }
+        "knock" => {
+            let rest = text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
+            let (target, reason) = match rest.split_once(' ') {
+                Some((t, r)) => {
+                    let r = r.trim().to_string();
+                    (t.trim().to_string(), if r.is_empty() { None } else { Some(r) })
+                }
+                None => (rest.trim().to_string(), None),
+            };
+            if target.is_empty() {
+                matrirc_msg(write, nick, "usage: knock <!room:server or #alias:server> [reason]").await?;
+                return Ok(());
+            }
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if bridge.to_matrix.try_send(ToMatrix::Knock { target, reason, reply: tx }).is_err() {
+                matrirc_msg(write, nick, "knock dispatch failed").await?;
+                return Ok(());
+            }
+            match rx.await {
+                Ok(Ok(msg)) => matrirc_msg(write, nick, &msg).await?,
+                Ok(Err(e)) => matrirc_msg(write, nick, &format!("knock failed: {e}")).await?,
+                Err(_) => matrirc_msg(write, nick, "knock cancelled").await?,
+            }
+        }
+        "join" => {
+            let arg = text.split_whitespace().nth(1).unwrap_or("");
+            if arg.is_empty() {
+                matrirc_msg(write, nick, "usage: join <!room_id:server or #alias:server>").await?;
+                return Ok(());
+            }
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if bridge.to_matrix.try_send(ToMatrix::JoinByAlias { alias: arg.to_string(), reply: tx }).is_err() {
+                matrirc_msg(write, nick, "join dispatch failed").await?;
+                return Ok(());
+            }
+            match rx.await {
+                Ok(Ok(chan)) => matrirc_msg(write, nick, &format!("joined {chan}")).await?,
+                Ok(Err(e)) => matrirc_msg(write, nick, &format!("join failed: {e}")).await?,
+                Err(_) => matrirc_msg(write, nick, "join cancelled").await?,
+            }
+        }
+        "dump" => {
+            let target = text.split_whitespace().nth(1).unwrap_or("").to_ascii_lowercase();
+            if target.is_empty() {
+                if s.reply_ids.is_empty() {
+                    matrirc_msg(write, nick, "no reply-id rings yet (join a channel or DM)").await?;
+                } else {
+                    matrirc_msg(write, nick, "windows with reply-id rings:").await?;
+                    let mut keys: Vec<_> = s.reply_ids.iter().collect();
+                    keys.sort_by(|a, b| a.0.cmp(b.0));
+                    for (k, q) in keys {
+                        matrirc_msg(write, nick, &format!("  {k}  ({} entries)", q.len())).await?;
+                    }
+                    matrirc_msg(write, nick, "usage: dump <window>").await?;
+                }
+                return Ok(());
+            }
+            match s.reply_ids.get(&target) {
+                Some(q) => {
+                    matrirc_msg(write, nick,
+                        &format!("ring {target} entries={}/{REPLY_RING_CAP}", q.len())).await?;
+                    for (short, eid, sender, snip) in q.iter().rev() {
+                        matrirc_msg(write, nick,
+                            &format!("  [{short}] {sender}: {snip}  ({eid})")).await?;
+                    }
+                }
+                None => {
+                    matrirc_msg(write, nick, &format!("no ring for '{target}'")).await?;
+                    if !s.reply_ids.is_empty() {
+                        let mut keys: Vec<&String> = s.reply_ids.keys().collect();
+                        keys.sort();
+                        let joined = keys.iter().map(|k| k.as_str()).collect::<Vec<_>>().join(", ");
+                        matrirc_msg(write, nick, &format!("known: {joined}")).await?;
+                    }
+                }
+            }
+        }
+        "ids" => {
+            let arg = text.split_whitespace().nth(1).unwrap_or("").to_ascii_lowercase();
+            let new = match arg.as_str() {
+                "" | "status" => None,
+                "on" | "true" | "1" => Some(true),
+                "off" | "false" | "0" => Some(false),
+                "toggle" => Some(!s.show_reply_ids),
+                _ => {
+                    matrirc_msg(write, nick, "usage: ids [on|off|toggle|status]").await?;
+                    return Ok(());
+                }
+            };
+            if let Some(v) = new { s.show_reply_ids = v; }
+            let state = if s.show_reply_ids { "on" } else { "off" };
+            matrirc_msg(write, nick,
+                &format!("reply ids: {state} (IRCv3 msgid tag; new messages only)")).await?;
+        }
         other => {
             matrirc_msg(write, nick, &format!("unknown command: {other}  (try `help`)")).await?;
         }
@@ -688,6 +960,8 @@ async fn backfill_channel(
     room: &matrix_sdk::ruma::RoomId,
     bridge: &Bridge,
     caps: &HashSet<String>,
+    reply_ids: &mut ReplyRing,
+    show_reply_ids: bool,
 ) -> Result<()> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     if bridge
@@ -711,6 +985,9 @@ async fn backfill_channel(
     let is_dm = !chan.starts_with('#');
     let peer_nick = if is_dm { bridge.dm_nick_for(room) } else { None };
 
+    // Ring key matches the irssi window name: chan for channels, peer for DMs.
+    let ring_key: &str = peer_nick.as_deref().unwrap_or(chan);
+    let tags_cap = caps.contains(MESSAGE_TAGS_CAP);
     for m in msgs {
         // For DM own-messages: ZNC-style replay → source=self, target=peer.
         // irssi renders these as outgoing in the peer's query window even
@@ -721,12 +998,25 @@ async fn backfill_channel(
         } else {
             (format!("{}!{0}@matrix", m.sender_nick), chan)
         };
-        for piece in m.body.split('\n') {
-            if piece.is_empty() { continue; }
-            let mut out = Message::with_prefix(&prefix, "PRIVMSG", vec![target.into(), piece.into()]);
-            if server_time {
-                if let Some(iso) = ms_to_iso(m.origin_ms) {
-                    out = out.with_tag("time", iso);
+        let time_tag = server_time.then(|| ms_to_iso(m.origin_ms)).flatten();
+        if let Some(ref q) = m.reply_quote {
+            let mut out = Message::with_prefix(&prefix, "PRIVMSG", vec![target.into(), q.clone()]);
+            if let Some(ref iso) = time_tag {
+                out = out.with_tag("time", iso.clone());
+            }
+            send(write, out).await?;
+        }
+        let (msgid, pieces) = make_payloads(
+            &m.body, &m.sender_nick, Some(m.event_id.clone()), ring_key, reply_ids, show_reply_ids,
+        );
+        for (i, payload) in pieces.into_iter().enumerate() {
+            let mut out = Message::with_prefix(&prefix, "PRIVMSG", vec![target.into(), payload]);
+            if let Some(ref iso) = time_tag {
+                out = out.with_tag("time", iso.clone());
+            }
+            if i == 0 && tags_cap {
+                if let Some(id) = &msgid {
+                    out = out.with_tag("msgid", id.clone());
                 }
             }
             send(write, out).await?;
@@ -931,7 +1221,7 @@ async fn handle_notice(
     let Some(dest) = resolve_send_target(target, bridge) else {
         return no_such(write, nick, target).await;
     };
-    let _ = bridge.to_matrix.try_send(make_send_cmd(dest, body.clone(), false, true));
+    let _ = bridge.to_matrix.try_send(make_send_cmd(dest, body.clone(), false, true, None));
     Ok(())
 }
 
@@ -985,21 +1275,81 @@ async fn handle_privmsg(
     let Some(raw) = msg.params.get(1) else { return Ok(()); };
     let (body, emote) = strip_ctcp_action(raw);
 
-    if target == ECHO_CHAN || target.eq_ignore_ascii_case(ECHO_NICK) {
-        let dest: &str = if target == ECHO_CHAN { ECHO_CHAN } else { nick };
-        send(write, Message::with_prefix(ECHO_PREFIX, "PRIVMSG", vec![dest.into(), format!("echo: {body}")])).await?;
-        return Ok(());
-    }
     if target.eq_ignore_ascii_case("matrirc") {
         if emote { return Ok(()); }
         if let Some(reply) = ctcp_reply_for(body) {
             return send(write, Message::with_prefix(BOT_PREFIX, "NOTICE", vec![nick.into(), format!("\x01{reply}\x01")])).await;
         }
-        return handle_bot_command(write, nick, body, bridge).await;
+        return handle_bot_command(write, nick, body, bridge, s).await;
+    }
+
+    // Reply syntax: `!r <id> <text>` where <id> is a known 4-lowercase-hex
+    // short id from the current window's ring. Match + hit → reply. Match +
+    // miss → strip the prefix, send body without a reply (so the `!r abcd`
+    // cruft doesn't leak into Matrix) and notice the user. No match → send
+    // unchanged.
+    let (body, reply_target) = match parse_reply_prefix(body) {
+        None => (body, None),
+        Some((short, rest)) => match lookup_reply_id(&s.reply_ids, target, short) {
+            Some(hit) => {
+                info!(%target, %short, event_id = %hit.0, "reply lookup hit");
+                (rest, Some(hit))
+            }
+            None => {
+                // Mis-typed id → drop the message entirely instead of leaking
+                // the intended-as-reply text to the room without context.
+                matrirc_notice(write, nick,
+                    &format!("reply id [{short}] not in ring for {target} — message dropped"),
+                ).await?;
+                let _ = rest;
+                return Ok(());
+            }
+        }
+    };
+    let in_reply_to = reply_target.as_ref().map(|(eid, _, _)| eid.clone());
+
+    if target == ECHO_CHAN || target.eq_ignore_ascii_case(ECHO_NICK) {
+        // `dest` is the wire PRIVMSG target (#echo for channel, the user's
+        // nick for /msg echo). `ring_key` is the irssi window the user types
+        // into — equal to `target`, which is what `parse_reply_prefix` keys
+        // off when resolving `!r`.
+        let dest: &str = if target == ECHO_CHAN { ECHO_CHAN } else { nick };
+        let ring_key: &str = if target == ECHO_CHAN { ECHO_CHAN } else { ECHO_NICK };
+        if let Some((_, orig_sender, orig_snippet)) = &reply_target {
+            send(write,
+                Message::with_prefix(ECHO_PREFIX, "PRIVMSG",
+                    vec![dest.into(), format!("\x0314↳ <{orig_sender}> {orig_snippet}\x0f")]),
+            ).await?;
+        }
+        let body_out = format!("echo: {body}");
+        let mut out = Message::with_prefix(ECHO_PREFIX, "PRIVMSG", vec![dest.into(), body_out.clone()]);
+        if s.show_reply_ids {
+            let eid = synth_echo_event_id(&mut s.echo_counter);
+            let short = remember_reply_id(&mut s.reply_ids, ring_key, eid,
+                ECHO_NICK.to_string(), body_snippet(&body_out));
+            if s.caps.contains(MESSAGE_TAGS_CAP) {
+                out = out.with_tag("msgid", short);
+            }
+        }
+        send(write, out).await?;
+        return Ok(());
+    }
+
+    // Reply context: emit the quote line as a PRIVMSG sourced from the
+    // user's own nick. irssi renders it inline in the channel they typed in
+    // (no echo-message cap needed). Other matrix users never see it because
+    // matrirc only sends it down this IRC socket — the actual matrix reply
+    // goes through the normal `to_matrix` send below.
+    if let Some((_, orig_sender, orig_snippet)) = &reply_target {
+        let source = format!("{nick}!{nick}@matrirc.local");
+        send(write,
+            Message::with_prefix(&source, "PRIVMSG",
+                vec![target.clone(), format!("\x0314↳ <{orig_sender}> {orig_snippet}\x0f")]),
+        ).await?;
     }
 
     // IRCv3 echo-message: if the client negotiated it, the client suppresses
-    // local echo and waits for the server to bounce back. Do it.
+    // local echo and waits for the server to bounce back the body.
     if s.caps.contains(ECHO_MESSAGE_CAP) {
         let source = format!("{nick}!{nick}@matrirc.local");
         let wire_body = if emote { format!("\x01ACTION {body}\x01") } else { body.to_string() };
@@ -1019,12 +1369,21 @@ async fn handle_privmsg(
             }
         }
     }
-    let cmd = make_send_cmd(dest, body.to_string(), emote, false);
+    let cmd = make_send_cmd(dest, body.to_string(), emote, false, in_reply_to);
     if let Err(e) = bridge.to_matrix.try_send(cmd) {
         warn!("dropping outbound: {e}");
         send(write, srv("NOTICE", vec![nick.into(), format!("send dropped: {e}")])).await?;
     }
     Ok(())
+}
+
+/// Parses a `!r <id> <text>` prefix. Matches only the exact 3-lowercase-letter
+/// short id format we emit (`aaa`..`zzz`); anything else passes through.
+fn parse_reply_prefix(body: &str) -> Option<(&str, &str)> {
+    let (id, text) = body.strip_prefix("!r ")?.split_once(' ')?;
+    let is_short = id.len() == 3
+        && id.bytes().all(|b| b.is_ascii_lowercase());
+    (is_short && !text.is_empty()).then_some((id, text))
 }
 
 enum SendTarget {
@@ -1040,10 +1399,16 @@ fn resolve_send_target(target: &str, bridge: &Bridge) -> Option<SendTarget> {
     matrix_sdk::ruma::OwnedUserId::try_from(canonical.as_str()).ok().map(SendTarget::Mxid)
 }
 
-fn make_send_cmd(dest: SendTarget, body: String, emote: bool, notice: bool) -> ToMatrix {
+fn make_send_cmd(
+    dest: SendTarget,
+    body: String,
+    emote: bool,
+    notice: bool,
+    in_reply_to: Option<matrix_sdk::ruma::OwnedEventId>,
+) -> ToMatrix {
     match dest {
-        SendTarget::Room(room) => ToMatrix::Send { room, body, emote, notice },
-        SendTarget::Mxid(mxid) => ToMatrix::SendToMxid { mxid, body, emote, notice },
+        SendTarget::Room(room) => ToMatrix::Send { room, body, emote, notice, in_reply_to },
+        SendTarget::Mxid(mxid) => ToMatrix::SendToMxid { mxid, body, emote, notice, in_reply_to },
     }
 }
 
@@ -1109,12 +1474,24 @@ async fn send_welcome(write: &mut (impl tokio::io::AsyncWrite + Unpin), nick: &s
     for line in MASCOT {
         send(write, srv(rpl::MOTD, vec![n.clone(), (*line).into()])).await?;
     }
-    let footer: &[(&str, Vec<String>)] = &[
+    let mut footer: Vec<(&str, Vec<String>)> = vec![
         (rpl::MOTD, vec![n.clone(), "- Matrix rooms auto-joined after this line.".into()]),
-        (rpl::MOTD, vec![n.clone(), "- /msg matrirc help  for bridge commands.".into()]),
-        (rpl::MOTD, vec![n.clone(), format!("- /join {ECHO_CHAN}  for a local echo channel.")]),
-        (rpl::ENDOFMOTD, vec![n, "End of /MOTD command.".into()]),
+        (rpl::MOTD, vec![n.clone(), "-".into()]),
+        (rpl::MOTD, vec![n.clone(), "- Bot commands ( /msg matrirc <cmd> ):".into()]),
     ];
+    for line in BOT_CMDS {
+        footer.push((rpl::MOTD, vec![n.clone(), format!("-   {line}")]));
+    }
+    footer.extend([
+        (rpl::MOTD, vec![n.clone(), "-".into()]),
+        (rpl::MOTD, vec![n.clone(), "- IRC syntax:".into()]),
+        (rpl::MOTD, vec![n.clone(), "-   /join #alias:server.org      join matrix room".into()]),
+        (rpl::MOTD, vec![n.clone(), "-   /msg @user:server hi         DM by mxid".into()]),
+        (rpl::MOTD, vec![n.clone(), "-   /me does a thing             m.emote".into()]),
+        (rpl::MOTD, vec![n.clone(), "-   !r <id> text                 reply to msg with that [id]".into()]),
+        (rpl::MOTD, vec![n.clone(), format!("-   /join {ECHO_CHAN}                       local echo bot for testing")]),
+        (rpl::ENDOFMOTD, vec![n, "End of /MOTD command.".into()]),
+    ]);
     for (code, params) in footer {
         send(write, srv(code, params.clone())).await?;
     }
@@ -1210,6 +1587,8 @@ mod tests {
                 room: r,
                 sender_nick: "bob".into(),
                 body: "did you see that?".into(),
+                event_id: None,
+                reply_quote: None,
                 is_own: false,
                 mentions_self: true,
             },
@@ -1233,6 +1612,8 @@ mod tests {
                 room: r,
                 sender_nick: "bob".into(),
                 body: "alice: ping".into(),
+                event_id: None,
+                reply_quote: None,
                 is_own: false,
                 mentions_self: true,
             },
@@ -1250,7 +1631,7 @@ mod tests {
         let mut s = registered_state("alice");
         s.joined.insert("#room-a".into());
         let out = route(
-            FromMatrix::Message { room: r, sender_nick: "alice".into(), body: "hi".into(), is_own: false, mentions_self: false },
+            FromMatrix::Message { room: r, sender_nick: "alice".into(), body: "hi".into(), event_id: None, reply_quote: None, is_own: false, mentions_self: false },
             &b, &mut s,
         ).await;
         assert_eq!(out, ":alice!alice@matrix PRIVMSG #room-a hi\r\n");
@@ -1266,7 +1647,7 @@ mod tests {
         }
         let mut s = registered_state("alice");
         let out = route(
-            FromMatrix::Message { room: r, sender_nick: "bob".into(), body: "yo".into(), is_own: false, mentions_self: false },
+            FromMatrix::Message { room: r, sender_nick: "bob".into(), body: "yo".into(), event_id: None, reply_quote: None, is_own: false, mentions_self: false },
             &b, &mut s,
         ).await;
         assert_eq!(out, ":bob!bob@matrix PRIVMSG alice yo\r\n");
@@ -1282,7 +1663,7 @@ mod tests {
         }
         let mut s = registered_state("alice");
         let out = route(
-            FromMatrix::Message { room: r, sender_nick: "alice".into(), body: "from other device".into(), is_own: true, mentions_self: false },
+            FromMatrix::Message { room: r, sender_nick: "alice".into(), body: "from other device".into(), event_id: None, reply_quote: None, is_own: true, mentions_self: false },
             &b, &mut s,
         ).await;
         assert_eq!(out, ":alice!alice@matrirc.local PRIVMSG bob :from other device\r\n");
@@ -1293,7 +1674,7 @@ mod tests {
         let (b, _rx) = Bridge::new(Mapping::default());
         let mut s = registered_state("alice");
         let out = route(
-            FromMatrix::Message { room: room("!nope:server"), sender_nick: "alice".into(), body: "hi".into(), is_own: false, mentions_self: false },
+            FromMatrix::Message { room: room("!nope:server"), sender_nick: "alice".into(), body: "hi".into(), event_id: None, reply_quote: None, is_own: false, mentions_self: false },
             &b, &mut s,
         ).await;
         assert!(out.is_empty(), "expected empty, got {out:?}");
@@ -1306,7 +1687,7 @@ mod tests {
         b.add_mapping(r.clone(), "#room-a".into(), "".into(), &[]);
         let mut s = registered_state("alice"); // no joined insert
         let out = route(
-            FromMatrix::Message { room: r, sender_nick: "alice".into(), body: "hi".into(), is_own: false, mentions_self: false },
+            FromMatrix::Message { room: r, sender_nick: "alice".into(), body: "hi".into(), event_id: None, reply_quote: None, is_own: false, mentions_self: false },
             &b, &mut s,
         ).await;
         assert!(out.is_empty(), "expected empty, got {out:?}");
@@ -1442,18 +1823,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn multi_line_body_produces_multiple_privmsg() {
+    async fn multi_line_body_flattens_to_single_privmsg() {
         let (b, _rx) = Bridge::new(Mapping::default());
         let r = room("!a:server");
         b.add_mapping(r.clone(), "#room-a".into(), "".into(), &[]);
         let mut s = registered_state("alice");
         s.joined.insert("#room-a".into());
         let out = route(
-            FromMatrix::Message { room: r, sender_nick: "alice".into(), body: "one\ntwo".into(), is_own: false, mentions_self: false },
+            FromMatrix::Message { room: r, sender_nick: "alice".into(), body: "one\ntwo".into(), event_id: None, reply_quote: None, is_own: false, mentions_self: false },
             &b, &mut s,
         ).await;
-        assert!(out.contains("PRIVMSG #room-a one\r\n"));
-        assert!(out.contains("PRIVMSG #room-a two\r\n"));
+        assert_eq!(out, ":alice!alice@matrix PRIVMSG #room-a :one ↵ two\r\n");
     }
 
     #[tokio::test]
@@ -1530,5 +1910,126 @@ mod tests {
 
         assert!(out.contains("353 carol = #room-a :alice bob carol"), "names: {out}");
         assert!(!out.contains(":matrix carol"), "placeholder leaked: {out}");
+    }
+
+    #[test]
+    fn flatten_newlines_uses_visible_marker() {
+        assert_eq!(flatten_newlines("one\ntwo\nthree"), "one ↵ two ↵ three");
+        assert_eq!(flatten_newlines("plain"), "plain");
+    }
+
+    #[test]
+    fn chunk_for_irc_under_budget_returns_single() {
+        let s = "x".repeat(SAFE_BODY_BYTES);
+        let v = chunk_for_irc(&s);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].len(), SAFE_BODY_BYTES);
+    }
+
+    #[test]
+    fn chunk_for_irc_splits_on_word_boundary_when_oversized() {
+        let part = "word ".repeat(120); // 600 bytes, plenty over budget
+        let v = chunk_for_irc(&part);
+        assert!(v.len() >= 2, "expected multiple pieces, got {}", v.len());
+        for piece in &v {
+            assert!(piece.len() <= SAFE_BODY_BYTES,
+                "chunk exceeded budget ({} > {SAFE_BODY_BYTES}): {piece:?}", piece.len());
+        }
+        // Concatenating back with spaces recovers all words.
+        let rejoined = v.join(" ");
+        let words_in = part.split_whitespace().count();
+        let words_out = rejoined.split_whitespace().count();
+        assert_eq!(words_in, words_out, "lost words: in={words_in} out={words_out}");
+    }
+
+    #[test]
+    fn chunk_for_irc_handles_multibyte_at_boundary() {
+        let core = "é".repeat(SAFE_BODY_BYTES); // 2 bytes per char → 800 bytes
+        let v = chunk_for_irc(&core);
+        for piece in &v {
+            assert!(piece.is_char_boundary(piece.len()));
+            assert!(piece.len() <= SAFE_BODY_BYTES);
+        }
+    }
+
+    #[test]
+    fn parse_reply_prefix_recognises_only_known_format() {
+        assert_eq!(parse_reply_prefix("!r abc hello"), Some(("abc", "hello")));
+        assert_eq!(parse_reply_prefix("!r zzz multi word reply"), Some(("zzz", "multi word reply")));
+        // Wrong length, wrong case, digits → not a reply prefix; user text passes through.
+        assert_eq!(parse_reply_prefix("!r ab hi"), None);
+        assert_eq!(parse_reply_prefix("!r ABC hi"), None);
+        assert_eq!(parse_reply_prefix("!r 123 hi"), None);
+        assert_eq!(parse_reply_prefix("!r abcd hi"), None);
+        assert_eq!(parse_reply_prefix("!r abc "), None);
+        assert_eq!(parse_reply_prefix("hello !r abc oops"), None);
+    }
+
+    fn eid_for(n: usize) -> matrix_sdk::ruma::OwnedEventId {
+        matrix_sdk::ruma::OwnedEventId::try_from(format!("$e{n}:h").as_str()).unwrap()
+    }
+
+    #[test]
+    fn short_event_id_is_deterministic_and_three_lowercase_letters() {
+        for n in 0..50 {
+            let s = short_event_id(&eid_for(n));
+            assert_eq!(s.len(), 3, "{s} should be 3 chars");
+            assert!(s.bytes().all(|b| b.is_ascii_lowercase()), "{s} non-letter");
+            assert_eq!(short_event_id(&eid_for(n)), s, "hash must be stable across calls");
+        }
+    }
+
+    #[test]
+    fn ring_stores_short_event_id_and_pops_oldest_when_full() {
+        let mut ring = ReplyRing::new();
+        let mut shorts = Vec::new();
+        for i in 0..(REPLY_RING_CAP + 3) {
+            shorts.push(remember_reply_id(
+                &mut ring, "#room", eid_for(i), "alice".into(), format!("body{i}"),
+            ));
+        }
+        // The three oldest entries fell off the front.
+        for stale in &shorts[..3] {
+            // Only assert eviction when no later push reused this short by collision.
+            let later_reused = shorts[3..].contains(stale);
+            assert_eq!(
+                lookup_reply_id(&ring, "#room", stale).is_some(),
+                later_reused,
+                "{stale}: later_reused={later_reused}",
+            );
+        }
+        // Newest entry is reachable.
+        let newest = shorts.last().unwrap();
+        let (eid, _, _) = lookup_reply_id(&ring, "#room", newest).expect("newest present");
+        assert_eq!(eid.as_str(), format!("$e{}:h", REPLY_RING_CAP + 2));
+        // Target lookup is case-insensitive.
+        assert!(lookup_reply_id(&ring, "#ROOM", newest).is_some());
+    }
+
+    #[test]
+    fn lookup_returns_latest_on_short_collision() {
+        // Find any two event ids that collide on the same short, push them
+        // in known order, verify the latest-pushed wins.
+        let mut seen: HashMap<String, matrix_sdk::ruma::OwnedEventId> = HashMap::new();
+        let (older, newer) = (0..20_000).find_map(|i| {
+            let id = eid_for(i);
+            let short = short_event_id(&id);
+            if let Some(prev) = seen.get(&short) {
+                return Some((prev.clone(), id));
+            }
+            seen.insert(short, id);
+            None
+        }).expect("collision in 20k samples");
+        eprintln!("collision: older={older} newer={newer}");
+        assert_ne!(older, newer, "must be distinct event ids");
+        assert_eq!(short_event_id(&older), short_event_id(&newer), "shorts must match");
+
+        let mut ring = ReplyRing::new();
+        let short = remember_reply_id(&mut ring, "#room", older.clone(), "a".into(), "old".into());
+        let _ = remember_reply_id(&mut ring, "#room", newer.clone(), "b".into(), "new".into());
+        let (hit, sender, snip) = lookup_reply_id(&ring, "#room", &short).expect("present");
+        assert_eq!(hit, newer, "latest pushed wins");
+        assert_eq!(sender, "b");
+        assert_eq!(snip, "new");
     }
 }
