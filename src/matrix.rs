@@ -861,6 +861,19 @@ async fn dm_peer_nick(client: &Client, room: &Room) -> Option<String> {
 async fn dm_peer(client: &Client, room: &Room) -> Option<(String, matrix_sdk::ruma::OwnedUserId)> {
     let me = client.user_id()?;
     let members = room.members(RoomMemberships::JOIN | RoomMemberships::INVITE).await.ok()?;
+
+    // First try to find a member that matches the room's display name.
+    // This is common in bridged DMs where the room is named after the peer.
+    let room_display_name = room.display_name().await.ok().map(|n| n.to_string());
+    if let Some(ref rdn) = room_display_name {
+        if let Some(m) = members.iter().find(|m| {
+            m.user_id() != me && m.display_name() == Some(rdn.as_str())
+        }) {
+            let nick = sanitize_nick(rdn);
+            return Some((nick, m.user_id().to_owned()));
+        }
+    }
+
     members.into_iter().find(|m| m.user_id() != me).map(|m| {
         let nick = m.display_name()
             .map(sanitize_nick)
