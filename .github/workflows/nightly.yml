@@ -24,8 +24,9 @@ jobs:
           # ubuntu-22.04 = glibc 2.35; older than ubuntu-latest for binary portability.
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
+          # Cross-compiled on arm: macos-13 (Intel) runners are starved.
           - target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-14
           - target: aarch64-apple-darwin
             runner: macos-14
     runs-on: ${{ matrix.runner }}
