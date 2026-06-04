@@ -15,6 +15,13 @@ brew tap pawelb0/tap
 brew install matrirc
 ```
 
+Nightly, tracking `main` (keg-only, so link it onto `PATH`):
+
+```
+brew install matrirc-nightly
+brew link --overwrite matrirc-nightly
+```
+
 From source:
 
 ```
