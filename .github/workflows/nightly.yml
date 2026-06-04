@@ -1,0 +1,195 @@
+name: Nightly
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  build:
+    permissions:
+      contents: read
+    # Cancel a superseded build, but never a publish (see the publish job).
+    concurrency:
+      group: nightly-build
+      cancel-in-progress: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ubuntu-22.04 = glibc 2.35; older than ubuntu-latest for binary portability.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: x86_64-apple-darwin
+            runner: macos-13
+          - target: aarch64-apple-darwin
+            runner: macos-14
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          # Binary at archive root so `bin.install "matrirc"` works after brew extracts.
+          tar -cJf "matrirc-${{ matrix.target }}.tar.xz" \
+            -C "target/${{ matrix.target }}/release" matrirc
+      - uses: actions/upload-artifact@v4
+        with:
+          name: matrirc-${{ matrix.target }}
+          path: matrirc-${{ matrix.target }}.tar.xz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-22.04
+    # Let an in-flight publish finish; a delete/recreate window must not be cut short.
+    concurrency:
+      group: nightly-publish
+      cancel-in-progress: false
+    permissions:
+      contents: write # GITHUB_TOKEN moves the `nightly` tag and updates the release
+    env:
+      TAG: nightly
+      REPO: pawelb0/matrirc
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Fetch tarballs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: matrirc-*
+          path: dist
+          merge-multiple: true
+
+      - name: Roll nightly release forward
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Move the tag to this commit via the API (this checkout has no push
+          # credentials). Then update the release in place — never delete it, so
+          # its download URLs stay live during publish.
+          if gh api "repos/$REPO/git/refs/tags/$TAG" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/$REPO/git/refs/tags/$TAG" \
+              -f sha="$GITHUB_SHA" -F force=true >/dev/null
+          else
+            gh api -X POST "repos/$REPO/git/refs" \
+              -f ref="refs/tags/$TAG" -f sha="$GITHUB_SHA" >/dev/null
+          fi
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release edit "$TAG" --repo "$REPO" --prerelease
+          else
+            gh release create "$TAG" --repo "$REPO" \
+              --title "Nightly" \
+              --notes "Rolling build; tracks the latest commit on main." \
+              --prerelease
+          fi
+          gh release upload "$TAG" --repo "$REPO" --clobber \
+            dist/matrirc-x86_64-unknown-linux-gnu.tar.xz \
+            dist/matrirc-x86_64-apple-darwin.tar.xz \
+            dist/matrirc-aarch64-apple-darwin.tar.xz
+
+      - name: Compute formula fields
+        id: meta
+        run: |
+          set -euo pipefail
+          cd dist
+          # sha256 over the exact bytes uploaded above.
+          linux_sha=$(sha256sum matrirc-x86_64-unknown-linux-gnu.tar.xz | cut -d' ' -f1)
+          intel_sha=$(sha256sum matrirc-x86_64-apple-darwin.tar.xz | cut -d' ' -f1)
+          arm_sha=$(sha256sum matrirc-aarch64-apple-darwin.tar.xz | cut -d' ' -f1)
+          # Strictly increasing version so `brew upgrade` always sees a newer build.
+          base=$(grep -m1 '^version' ../Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          stamp=$(date -u +%Y%m%d%H%M%S)
+          short=${GITHUB_SHA:0:7}
+          {
+            echo "version=${base}-nightly.${stamp}.${short}"
+            echo "linux_sha=$linux_sha"
+            echo "intel_sha=$intel_sha"
+            echo "arm_sha=$arm_sha"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Render formula
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          LINUX_SHA: ${{ steps.meta.outputs.linux_sha }}
+          INTEL_SHA: ${{ steps.meta.outputs.intel_sha }}
+          ARM_SHA: ${{ steps.meta.outputs.arm_sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          # Body and the closing RUBY sit at column 0 (the YAML `|` scalar strips
+          # the step indent), so the plain `<<RUBY` terminator matches.
+          cat > out/matrirc-nightly.rb <<RUBY
+          class MatrircNightly < Formula
+            desc "Local IRC server that bridges to a Matrix homeserver (nightly)"
+            homepage "https://github.com/${REPO}"
+            version "${VERSION}"
+            license "GPL-3.0-or-later"
+
+            # Not linked by default: stable matrirc owns bin/matrirc.
+            # Switch with: brew link --overwrite matrirc-nightly
+            keg_only "it conflicts with the stable matrirc formula"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/${REPO}/releases/download/${TAG}/matrirc-aarch64-apple-darwin.tar.xz"
+                sha256 "${ARM_SHA}"
+              end
+              on_intel do
+                url "https://github.com/${REPO}/releases/download/${TAG}/matrirc-x86_64-apple-darwin.tar.xz"
+                sha256 "${INTEL_SHA}"
+              end
+            end
+
+            on_linux do
+              on_intel do
+                url "https://github.com/${REPO}/releases/download/${TAG}/matrirc-x86_64-unknown-linux-gnu.tar.xz"
+                sha256 "${LINUX_SHA}"
+              end
+            end
+
+            def install
+              bin.install "matrirc"
+            end
+
+            test do
+              system bin/"matrirc", "--version"
+            end
+          end
+          RUBY
+          ruby -c out/matrirc-nightly.rb
+
+      - name: Checkout tap
+        uses: actions/checkout@v4
+        with:
+          repository: pawelb0/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Commit formula
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          cp out/matrirc-nightly.rb tap/Formula/matrirc-nightly.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/matrirc-nightly.rb
+          git diff --cached --quiet && exit 0
+          git commit -m "matrirc-nightly ${VERSION}"
+          git push
