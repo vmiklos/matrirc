@@ -12,8 +12,10 @@ jobs:
     permissions:
       contents: read
     # Cancel a superseded build, but never a publish (see the publish job).
+    # Per-target group: a newer push cancels the older build of the same
+    # target, but the three matrix legs never cancel each other.
     concurrency:
-      group: nightly-build
+      group: nightly-build-${{ matrix.target }}
       cancel-in-progress: true
     strategy:
       fail-fast: false
