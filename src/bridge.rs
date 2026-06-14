@@ -341,12 +341,13 @@ impl Bridge {
 
     /// Channels only, no DMs — auto-join iterates this.
     pub fn snapshot(&self) -> Vec<(String, OwnedRoomId)> {
+        // Iterate room_to_chan, to make sure we don't get multiple IRC channels for a room.
         self.mapping
             .read()
             .unwrap()
-            .chan_to_room
+            .room_to_chan
             .iter()
-            .map(|(c, r)| (c.clone(), r.clone()))
+            .map(|(r, c)| (c.clone(), r.clone()))
             .collect()
     }
 
@@ -585,5 +586,21 @@ mod tests {
         assert!(!b.take_if_sent_by_us(&first), "oldest should have been evicted");
         let recent = matrix_sdk::ruma::OwnedEventId::try_from(format!("$e{}:h", RECENT_SENT_CAP + 9).as_str()).unwrap();
         assert!(b.take_if_sent_by_us(&recent));
+    }
+
+    #[test]
+    fn snapshot_only_contains_primary_names() {
+        let (b, _rx) = Bridge::new(Mapping::default());
+        let r = RoomId::parse("!abc:server.org").unwrap();
+        b.add_mapping(
+            r.clone(),
+            "#primary".into(),
+            "topic".into(),
+            &["#alias1", "#alias2"],
+        );
+        let s = b.snapshot();
+        // This failed, len() was 3, not 1.
+        assert_eq!(s.len(), 1, "snapshot should only have 1 entry for the room");
+        assert_eq!(s[0], ("#primary".to_string(), r));
     }
 }
