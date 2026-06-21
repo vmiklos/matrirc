@@ -37,6 +37,13 @@ def msgid_modifier_cb(data, modifier, modifier_data, string):
     if match:
         prefix_and_target = match.group(1)
         body = match.group(3)
+        # For CTCP ACTION (/me) messages, the body is "\x01ACTION text\x01".
+        # Insert the [id] after the "\x01ACTION " prefix so the literal \x01
+        # control char stays at the very start (and thus invisible in weechat).
+        action_prefix = '\x01ACTION '
+        if body.startswith(action_prefix):
+            rest_body = body[len(action_prefix):]
+            return f"{tags_str} {prefix_and_target}:{action_prefix}[{msgid}] {rest_body}"
         # Reconstruct the message with the [id] prefix in the body.
         return f"{tags_str} {prefix_and_target}:[{msgid}] {body}"
 
